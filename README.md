@@ -47,6 +47,68 @@ ADMIN_USER_IDS=
 python -m family_planner_bot
 ```
 
+## Docker Deploy
+
+Подготовьте `.env`:
+
+```powershell
+Copy-Item .env.docker.example .env
+```
+
+Заполните минимум:
+
+```env
+TELEGRAM_BOT_TOKEN=токен_от_BotFather
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.2
+REMINDER_LOOKAHEAD_MINUTES=10
+DAILY_DIGEST_TIME=
+DAILY_DIGEST_CHAT_IDS=
+ALLOWED_CHAT_IDS=
+ALLOWED_USER_IDS=
+ADMIN_USER_IDS=
+```
+
+В контейнере база хранится в Docker volume по пути `/data/family_planner.sqlite3`. Это задается в `docker-compose.yml` через `DATABASE_PATH`, поэтому пересборка контейнера не удаляет данные. Safety-копии после `/restore` хранятся в отдельном volume `family_planner_restore_safety`.
+
+Запуск:
+
+```bash
+docker compose up -d --build
+```
+
+Логи:
+
+```bash
+docker compose logs -f family-bot
+```
+
+Остановка:
+
+```bash
+docker compose down
+```
+
+Обновление на VPS:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Резервная копия volume на сервере:
+
+```bash
+docker compose exec family-bot python - <<'PY'
+from pathlib import Path
+from family_planner_bot.db import Database
+Database('/data/family_planner.sqlite3').backup_to(Path('/data/manual-backup.sqlite3'))
+print('/data/manual-backup.sqlite3')
+PY
+```
+
+Для обычного семейного backup проще использовать команду `/backup` в Telegram. Она отправит SQLite-файл прямо в чат администратора.
+
 ## Быстрое меню
 
 После `/start` бот показывает кнопки:

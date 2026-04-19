@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-*
+*.log
+.git/
+.gitignore
+restore-safety/
+bot.out.log
+bot.err.log

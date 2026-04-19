@@ -1,0 +1,17 @@
+services:
+  family-bot:
+    build: .
+    container_name: family-planner-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/family_planner.sqlite3
+      TZ: Europe/Moscow
+    volumes:
+      - family_planner_data:/data
+      - family_planner_restore_safety:/app/restore-safety
+
+volumes:
+  family_planner_data:
+  family_planner_restore_safety:
