@@ -37,6 +37,16 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init_schema()
 
+    def backup_to(self, target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(self.path)
+        target = sqlite3.connect(target_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+
     @contextmanager
     def connect(self) -> Iterable[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)

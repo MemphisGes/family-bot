@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import tempfile
 from io import BytesIO
 from html import escape
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -160,7 +162,7 @@ class FamilyPlannerBot:
             "Можно также написать фразу обычным текстом, например: завтра в 18:00 у Маши стоматолог, "
             "и AI соберет запись на подтверждение. "
             "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
-            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /add, /ask, /done.",
+            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /backup, /add, /ask, /done.",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -466,6 +468,29 @@ class FamilyPlannerBot:
             caption=f"Календарь семьи на {days} дн.",
             reply_markup=MENU_KEYBOARD,
         )
+
+    async def backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+        filename = f"family-planner-backup-{timestamp}.sqlite3"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = Path(temp_dir) / filename
+            try:
+                await asyncio.to_thread(self.db.backup_to, backup_path)
+            except Exception:
+                LOGGER.exception("Failed to create database backup")
+                await update.effective_message.reply_text(
+                    "Не смог создать резервную копию базы.",
+                    reply_markup=MENU_KEYBOARD,
+                )
+                return
+
+            with backup_path.open("rb") as file:
+                await update.effective_message.reply_document(
+                    document=file,
+                    filename=filename,
+                    caption="Резервная копия семейного планера.",
+                    reply_markup=MENU_KEYBOARD,
+                )
 
     async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -1706,6 +1731,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
         app.add_handler(CommandHandler("digest", self._restricted(self.digest)))
         app.add_handler(CommandHandler("export", self._restricted(self.export_calendar)))
+        app.add_handler(CommandHandler("backup", self._restricted(self.backup)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))
