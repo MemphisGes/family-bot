@@ -149,6 +149,19 @@ class Database:
                 (chat_id, member_id),
             ).fetchone()
 
+    def get_member_by_user_id(self, chat_id: int, telegram_user_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, telegram_user_id, name, username, mention, role, color
+                FROM members
+                WHERE chat_id = ? AND telegram_user_id = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (chat_id, telegram_user_id),
+            ).fetchone()
+
     def add_item(
         self,
         chat_id: int,
@@ -276,6 +289,28 @@ class Database:
     def list_context(self, chat_id: int, days: int = 14) -> list[Item]:
         now = datetime.now()
         return self.list_window(chat_id, now - timedelta(days=1), now + timedelta(days=days))
+
+    def list_tasks(self, chat_id: int, people: list[str] | None = None) -> list[Item]:
+        params: list[object] = [chat_id]
+        person_filter = ""
+        if people:
+            placeholders = ",".join("?" for _ in people)
+            person_filter = f" AND person IN ({placeholders})"
+            params.extend(people)
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM items
+                WHERE chat_id = ?
+                  AND kind = 'task'
+                  AND is_done = 0
+                  {person_filter}
+                ORDER BY COALESCE(due_at, created_at), id
+                """,
+                params,
+            ).fetchall()
+        return [self._item_from_row(row) for row in rows]
 
     def add_reminder(self, chat_id: int, remind_at: str, text: str, person: str | None) -> int:
         now = datetime.now().isoformat(timespec="seconds")

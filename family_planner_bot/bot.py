@@ -34,6 +34,7 @@ NOTIFICATION_TITLES = {
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["☀️ Сегодня", "📅 Неделя"],
+        ["👤 Мои задачи", "✅ Все задачи"],
         ["🗓️ Событие", "✅ Задача", "🛒 Покупки"],
         ["🎁 Вишлист", "🔔 Напоминание"],
     ],
@@ -414,6 +415,26 @@ class FamilyPlannerBot:
         items = self.db.list_window(update.effective_chat.id, now - timedelta(hours=1), end)
         await self._send_items_with_actions(update, "Ближайшие 7 дней", items)
 
+    async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user:
+            await update.effective_message.reply_text("Не вижу Telegram-пользователя.", reply_markup=MENU_KEYBOARD)
+            return
+        member = self.db.get_member_by_user_id(update.effective_chat.id, user.id)
+        if not member:
+            await update.effective_message.reply_text(
+                "Сначала зарегистрируйтесь как член семьи: /join Имя",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+        people = self._member_person_values(member)
+        items = self.db.list_tasks(update.effective_chat.id, people)
+        await self._send_items_with_actions(update, "Мои задачи", items)
+
+    async def all_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        items = self.db.list_tasks(update.effective_chat.id)
+        await self._send_items_with_actions(update, "Все задачи", items)
+
     async def _send_items_with_actions(self, update: Update, title: str, items: list[Item]) -> None:
         if not items:
             await update.effective_message.reply_text(f"{title}\nПока ничего нет.", reply_markup=MENU_KEYBOARD)
@@ -492,6 +513,12 @@ class FamilyPlannerBot:
             return
         if text in {"Неделя", "📅 Неделя"}:
             await self.week(update, context)
+            return
+        if text in {"Мои задачи", "👤 Мои задачи"}:
+            await self.my_tasks(update, context)
+            return
+        if text in {"Все задачи", "✅ Все задачи"}:
+            await self.all_tasks(update, context)
             return
         if text == "Помощь":
             await self.help(update, context)
@@ -839,6 +866,15 @@ class FamilyPlannerBot:
 
     def _member_display(self, member) -> str:
         return member["mention"] or str(member["name"])
+
+    def _member_person_values(self, member) -> list[str]:
+        values = [
+            member["mention"],
+            member["name"],
+            f"@{member['username']}" if member["username"] else None,
+            member["username"],
+        ]
+        return [str(value) for value in dict.fromkeys(values) if value]
 
     async def _show_constructor_confirmation(
         self,
@@ -1193,6 +1229,8 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("done", self._restricted(self.done)))
         app.add_handler(CommandHandler("today", self._restricted(self.today)))
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
+        app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
+        app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("ask", self._restricted(self.ask)))
         app.add_handler(CallbackQueryHandler(self.choose_member, pattern=r"^member:"))
         app.add_handler(CallbackQueryHandler(self.confirm_constructor, pattern=r"^confirm:"))
