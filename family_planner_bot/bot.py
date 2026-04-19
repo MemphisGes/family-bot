@@ -301,7 +301,7 @@ class FamilyPlannerBot:
         item_id = self.db.add_item(update.effective_chat.id, kind, text)
         if notify_title:
             await self._notify_family(update, self._build_notification(update, notify_title, item_id, text))
-        await update.message.reply_text(f"{reply_title}: #{item_id}", reply_markup=MENU_KEYBOARD)
+        await update.effective_message.reply_text(f"{reply_title}: #{item_id}", reply_markup=MENU_KEYBOARD)
         return item_id
 
     async def add_expense(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -437,6 +437,7 @@ class FamilyPlannerBot:
         if text == "Отмена":
             context.user_data.pop("flow", None)
             context.user_data.pop("constructor", None)
+            context.user_data.pop("pending_confirmation", None)
             await update.message.reply_text("Ок, действие отменено.", reply_markup=MENU_KEYBOARD)
             return
 
@@ -613,7 +614,7 @@ class FamilyPlannerBot:
             return
 
         context.user_data.pop("constructor", None)
-        await self._save_constructor_result(update, flow, state["data"])
+        await self._show_constructor_confirmation(update, context, flow, state["data"])
 
     async def choose_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -662,7 +663,7 @@ class FamilyPlannerBot:
             return
 
         context.user_data.pop("constructor", None)
-        await self._save_constructor_result(update, flow, state["data"])
+        await self._show_constructor_confirmation(update, context, flow, state["data"])
 
     def _constructor_prompt(self, flow: str, step: int) -> str:
         total = len(CONSTRUCTORS[flow])
@@ -676,6 +677,101 @@ class FamilyPlannerBot:
 
     def _member_display(self, member) -> str:
         return member["mention"] or str(member["name"])
+
+    async def _show_constructor_confirmation(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        flow: str,
+        data: dict[str, str | None],
+    ) -> None:
+        context.user_data["pending_confirmation"] = {"flow": flow, "data": data}
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Сохранить", callback_data="confirm:save"),
+                    InlineKeyboardButton("Изменить", callback_data="confirm:edit"),
+                ],
+                [InlineKeyboardButton("Отмена", callback_data="confirm:cancel")],
+            ]
+        )
+        await update.effective_message.reply_html(
+            self._constructor_summary(flow, data),
+            reply_markup=keyboard,
+        )
+
+    async def confirm_constructor(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        if not self._is_access_allowed(update):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+
+        action = (query.data or "").removeprefix("confirm:")
+        pending = context.user_data.get("pending_confirmation")
+        if not pending:
+            await query.answer("Нет записи для подтверждения", show_alert=True)
+            return
+
+        flow = pending["flow"]
+        data = pending["data"]
+        if action == "save":
+            context.user_data.pop("pending_confirmation", None)
+            await query.answer("Сохраняю")
+            await query.edit_message_text("Сохраняю запись...")
+            await self._save_constructor_result(update, flow, data)
+            return
+
+        if action == "edit":
+            context.user_data.pop("pending_confirmation", None)
+            context.user_data["constructor"] = {"flow": flow, "step": 0, "data": {}}
+            await query.answer()
+            await query.edit_message_text("Ок, заполним заново.")
+            await query.message.reply_text(
+                self._constructor_prompt(flow, 0),
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        if action == "cancel":
+            context.user_data.pop("pending_confirmation", None)
+            await query.answer()
+            await query.edit_message_text("Запись отменена.")
+            return
+
+        await query.answer("Неизвестное действие", show_alert=True)
+
+    def _constructor_summary(self, flow: str, data: dict[str, str | None]) -> str:
+        labels = {
+            "event": "Проверьте событие",
+            "task": "Проверьте задачу",
+            "shopping": "Проверьте покупку",
+            "wishlist": "Проверьте вишлист",
+            "reminder": "Проверьте напоминание",
+        }
+        field_labels = {
+            "date": "Дата",
+            "person": "Кому",
+            "title": "Что",
+            "category": "Категория",
+            "recurrence": "Повтор",
+            "notes": "Комментарий",
+        }
+        lines = [f"<b>{escape(labels.get(flow, 'Проверьте запись'))}</b>"]
+        for field, _prompt in CONSTRUCTORS[flow]:
+            value = data.get(field)
+            if not value:
+                continue
+            if field == "date":
+                parsed = parse_datetime(value)
+                value = parsed.strftime("%d.%m %H:%M") if parsed else value
+            label = escape(field_labels.get(field, field))
+            formatted = self._format_person(value) if field == "person" else escape(value)
+            lines.append(f"{label}: {formatted}")
+        lines.append("")
+        lines.append("Сохранить запись?")
+        return "\n".join(lines)
 
     def _validate_constructor_field(
         self, flow: str, field: str, value: str | None
@@ -691,10 +787,11 @@ class FamilyPlannerBot:
     async def _save_constructor_result(
         self, update: Update, flow: str, data: dict[str, str | None]
     ) -> None:
+        message = update.effective_message
         if flow in {"event", "task"}:
             when = parse_datetime(data["date"] or "")
             if not when:
-                await update.message.reply_text("Не понял дату. Запись не сохранена.", reply_markup=MENU_KEYBOARD)
+                await message.reply_text("Не понял дату. Запись не сохранена.", reply_markup=MENU_KEYBOARD)
                 return
             kind = flow
             label = "событие" if flow == "event" else "задача"
@@ -724,7 +821,7 @@ class FamilyPlannerBot:
                     category,
                 ),
             )
-            await update.message.reply_html(f"Добавлено: {label} #{item_id}", reply_markup=MENU_KEYBOARD)
+            await message.reply_html(f"Добавлено: {label} #{item_id}", reply_markup=MENU_KEYBOARD)
             return
 
         if flow == "shopping":
@@ -763,13 +860,13 @@ class FamilyPlannerBot:
                     data.get("category"),
                 ),
             )
-            await update.message.reply_html(f"Добавлено в вишлист: #{item_id}", reply_markup=MENU_KEYBOARD)
+            await message.reply_html(f"Добавлено в вишлист: #{item_id}", reply_markup=MENU_KEYBOARD)
             return
 
         if flow == "reminder":
             when = parse_datetime(data["date"] or "")
             if not when:
-                await update.message.reply_text("Не понял дату. Напоминание не сохранено.", reply_markup=MENU_KEYBOARD)
+                await message.reply_text("Не понял дату. Напоминание не сохранено.", reply_markup=MENU_KEYBOARD)
                 return
             reminder_id = self.db.add_reminder(
                 update.effective_chat.id,
@@ -788,10 +885,10 @@ class FamilyPlannerBot:
                     when,
                 ),
             )
-            await update.message.reply_html(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
+            await message.reply_html(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
             return
 
-        await update.message.reply_text("Не понял конструктор. Запись не сохранена.", reply_markup=MENU_KEYBOARD)
+        await message.reply_text("Не понял конструктор. Запись не сохранена.", reply_markup=MENU_KEYBOARD)
 
     async def _save_member(
         self,
@@ -936,6 +1033,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
         app.add_handler(CommandHandler("ask", self._restricted(self.ask)))
         app.add_handler(CallbackQueryHandler(self.choose_member, pattern=r"^member:"))
+        app.add_handler(CallbackQueryHandler(self.confirm_constructor, pattern=r"^confirm:"))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._restricted(self.handle_menu_text)))
         app.job_queue.run_repeating(self.send_due_reminders, interval=60, first=5)
         return app
