@@ -159,7 +159,7 @@ class FamilyPlannerBot:
             "Можно также написать фразу обычным текстом, например: завтра в 18:00 у Маши стоматолог, "
             "и AI соберет запись на подтверждение. "
             "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
-            "Команды оставлены как запасной режим: /today, /week, /add, /ask, /done.",
+            "Команды оставлены как запасной режим: /today, /week, /digest, /add, /ask, /done.",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -424,6 +424,37 @@ class FamilyPlannerBot:
         items = self.db.list_window(update.effective_chat.id, now - timedelta(hours=1), end)
         await self._send_items_with_actions(update, "Ближайшие 7 дней", items)
 
+    async def digest(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        mode = (context.args[0].lower() if context.args else "").strip()
+        now = datetime.now()
+        if mode in {"week", "неделя", "7"}:
+            start = now
+            end = now + timedelta(days=7)
+            title = "Семейный дайджест на неделю"
+        else:
+            start = datetime.combine(now.date(), time.min)
+            end = start + timedelta(days=1)
+            title = "Семейный дайджест на сегодня"
+
+        items = self.db.list_window(update.effective_chat.id, start, end)
+        reminders = self.db.list_reminders_window(update.effective_chat.id, start, end)
+        context_text = self._digest_context(title, items, reminders)
+
+        if self.ai.is_enabled():
+            question = (
+                "Составь короткий семейный дайджест на русском: сначала главное на сегодня или неделю, "
+                "потом риски/что подготовить, потом покупки и напоминания. Без длинных вступлений."
+            )
+            try:
+                answer = await asyncio.to_thread(self.ai.answer, question, context_text)
+            except Exception:
+                LOGGER.exception("AI digest failed")
+                answer = self._fallback_digest(title, items, reminders)
+        else:
+            answer = self._fallback_digest(title, items, reminders)
+
+        await update.effective_message.reply_text(answer[:3900], reply_markup=MENU_KEYBOARD)
+
     async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         if not user:
@@ -487,6 +518,27 @@ class FamilyPlannerBot:
                 ],
             ]
         )
+
+    def _digest_context(self, title: str, items: list[Item], reminders: list) -> str:
+        lines = [title, "", render_context(items)]
+        if reminders:
+            lines.append("")
+            lines.append("Напоминания:")
+            lines.extend(self._format_reminder_line(reminder) for reminder in reminders[:30])
+        return "\n".join(lines)
+
+    def _fallback_digest(self, title: str, items: list[Item], reminders: list) -> str:
+        lines = [render_items(title, items)]
+        if reminders:
+            lines.append("")
+            lines.append("🔔 Напоминания")
+            lines.extend(self._format_reminder_line(reminder) for reminder in reminders)
+        return "\n".join(lines)
+
+    def _format_reminder_line(self, reminder) -> str:
+        when = format_dt(reminder["remind_at"])
+        person = f" [{reminder['person']}]" if reminder["person"] else ""
+        return f"#{reminder['id']} {when}{person}: {reminder['text']}"
 
     async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         question = " ".join(context.args).strip()
@@ -1490,6 +1542,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("done", self._restricted(self.done)))
         app.add_handler(CommandHandler("today", self._restricted(self.today)))
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
+        app.add_handler(CommandHandler("digest", self._restricted(self.digest)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))

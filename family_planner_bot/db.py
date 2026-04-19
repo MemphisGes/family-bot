@@ -337,6 +337,26 @@ class Database:
             ).fetchall()
         return list(rows)
 
+    def list_reminders_window(self, chat_id: int, start: datetime, end: datetime) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, chat_id, person, text, remind_at, sent_at
+                FROM reminders
+                WHERE chat_id = ?
+                  AND sent_at IS NULL
+                  AND remind_at >= ?
+                  AND remind_at < ?
+                ORDER BY remind_at, id
+                """,
+                (
+                    chat_id,
+                    start.isoformat(timespec="seconds"),
+                    end.isoformat(timespec="seconds"),
+                ),
+            ).fetchall()
+        return list(rows)
+
     def mark_reminder_sent(self, reminder_id: int) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         with self.connect() as conn:
