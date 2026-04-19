@@ -24,6 +24,13 @@ class Item:
     is_done: bool
 
 
+@dataclass(frozen=True)
+class CompletionResult:
+    found: bool
+    advanced: bool = False
+    next_at: str | None = None
+
+
 class Database:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
@@ -202,12 +209,33 @@ class Database:
             return int(cur.lastrowid)
 
     def mark_done(self, chat_id: int, item_id: int) -> bool:
+        return self.complete_item(chat_id, item_id).found
+
+    def complete_item(self, chat_id: int, item_id: int) -> CompletionResult:
+        item = self.get_item(chat_id, item_id)
+        if not item:
+            return CompletionResult(found=False)
+
+        source_value = item.starts_at or item.due_at
+        if item.recurrence and source_value:
+            next_at = self._next_future_occurrence(source_value, item.recurrence)
+            if next_at:
+                field = "starts_at" if item.starts_at else "due_at"
+                next_s = next_at.isoformat(timespec="seconds")
+                with self.connect() as conn:
+                    cur = conn.execute(
+                        f"UPDATE items SET {field} = ?, is_done = 0 WHERE chat_id = ? AND id = ?",
+                        (next_s, chat_id, item_id),
+                    )
+                    if cur.rowcount > 0:
+                        return CompletionResult(found=True, advanced=True, next_at=next_s)
+
         with self.connect() as conn:
             cur = conn.execute(
                 "UPDATE items SET is_done = 1 WHERE chat_id = ? AND id = ?",
                 (chat_id, item_id),
             )
-            return cur.rowcount > 0
+            return CompletionResult(found=cur.rowcount > 0)
 
     def get_item(self, chat_id: int, item_id: int) -> Item | None:
         with self.connect() as conn:
@@ -447,6 +475,27 @@ class Database:
             day = min(value.day, Database._days_in_month(year, month))
             return value.replace(year=year, month=month, day=day)
         return value
+
+    @staticmethod
+    def _next_future_occurrence(source_value: str, recurrence: str) -> datetime | None:
+        try:
+            occurrence = datetime.fromisoformat(source_value)
+        except ValueError:
+            return None
+
+        next_occurrence = Database._next_occurrence(occurrence, recurrence)
+        if next_occurrence == occurrence:
+            return None
+
+        now = datetime.now()
+        guard = 0
+        while next_occurrence <= now and guard < 500:
+            previous = next_occurrence
+            next_occurrence = Database._next_occurrence(next_occurrence, recurrence)
+            if next_occurrence == previous:
+                return None
+            guard += 1
+        return next_occurrence
 
     @staticmethod
     def _days_in_month(year: int, month: int) -> int:

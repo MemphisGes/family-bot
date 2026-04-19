@@ -406,11 +406,8 @@ class FamilyPlannerBot:
         if not context.args or not context.args[0].isdigit():
             await update.message.reply_text("Формат: /done ID")
             return
-        ok = self.db.mark_done(update.effective_chat.id, int(context.args[0]))
-        await update.message.reply_text(
-            "Готово." if ok else "Не нашел такую запись в этом чате.",
-            reply_markup=MENU_KEYBOARD,
-        )
+        result = self.db.complete_item(update.effective_chat.id, int(context.args[0]))
+        await update.message.reply_text(self._completion_text(result), reply_markup=MENU_KEYBOARD)
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         now = datetime.now()
@@ -533,6 +530,27 @@ class FamilyPlannerBot:
                 ],
             ]
         )
+
+    def _completion_text(self, result, item: Item | None = None) -> str:
+        if not result.found:
+            return "Не нашел такую запись в этом чате."
+        if result.advanced and result.next_at:
+            when = format_dt(result.next_at)
+            if item:
+                return f"Выполнено: #{item.id} {item.title}\nСледующий повтор: {when}"
+            return f"Готово. Следующий повтор: {when}"
+        if item:
+            return f"Выполнено: #{item.id} {item.title}"
+        return "Готово."
+
+    @staticmethod
+    def _parse_iso_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
 
     async def _build_digest_answer(
         self, chat_id: int, title: str, start: datetime, end: datetime
@@ -826,10 +844,12 @@ class FamilyPlannerBot:
             return
 
         if action == "done":
-            self.db.mark_done(chat_id, item_id)
+            result = self.db.complete_item(chat_id, item_id)
             await query.answer("Готово")
-            await query.edit_message_text(f"Выполнено: #{item_id} {item.title}")
-            await self._notify_family(update, self._build_notification(update, "Запись выполнена", item_id, item.title, item.person))
+            await query.edit_message_text(self._completion_text(result, item))
+            notify_title = "Повтор перенесен" if result.advanced else "Запись выполнена"
+            next_at = self._parse_iso_datetime(result.next_at) if result.next_at else None
+            await self._notify_family(update, self._build_notification(update, notify_title, item_id, item.title, item.person, next_at))
             return
 
         if action == "delete":
@@ -993,11 +1013,8 @@ class FamilyPlannerBot:
             if not text.isdigit():
                 await update.message.reply_text("Нужен числовой ID записи.", reply_markup=MENU_KEYBOARD)
                 return
-            ok = self.db.mark_done(update.effective_chat.id, int(text))
-            await update.message.reply_text(
-                "Готово." if ok else "Не нашел такую запись в этом чате.",
-                reply_markup=MENU_KEYBOARD,
-            )
+            result = self.db.complete_item(update.effective_chat.id, int(text))
+            await update.message.reply_text(self._completion_text(result), reply_markup=MENU_KEYBOARD)
             return
 
         await update.message.reply_text("Не понял действие. Выберите пункт меню заново.", reply_markup=MENU_KEYBOARD)
