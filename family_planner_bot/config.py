@@ -18,6 +18,7 @@ class Settings:
     daily_digest_chat_ids: frozenset[int]
     allowed_chat_ids: frozenset[int]
     allowed_user_ids: frozenset[int]
+    admin_user_ids: frozenset[int]
 
 
 def load_settings() -> Settings:
@@ -43,6 +44,7 @@ def load_settings() -> Settings:
         daily_digest_chat_ids=_parse_int_set(os.getenv("DAILY_DIGEST_CHAT_IDS", "")),
         allowed_chat_ids=_parse_int_set(os.getenv("ALLOWED_CHAT_IDS", "")),
         allowed_user_ids=_parse_int_set(os.getenv("ALLOWED_USER_IDS", "")),
+        admin_user_ids=_parse_int_set(os.getenv("ADMIN_USER_IDS", "")),
     )
 
 

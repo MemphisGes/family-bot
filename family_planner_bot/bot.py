@@ -1687,6 +1687,12 @@ class FamilyPlannerBot:
             return True
         return False
 
+    def _is_admin_allowed(self, update: Update) -> bool:
+        if not self.settings.admin_user_ids:
+            return self._is_access_allowed(update)
+        user = update.effective_user
+        return bool(user and user.id in self.settings.admin_user_ids)
+
     async def _deny_access(self, update: Update) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else "unknown"
         user_id = update.effective_user.id if update.effective_user else "unknown"
@@ -1696,6 +1702,14 @@ class FamilyPlannerBot:
                 "Доступ к семейному боту закрыт. Отправьте /id владельцу бота, чтобы вас добавили."
             )
 
+    async def _deny_admin_access(self, update: Update) -> None:
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        LOGGER.warning("Denied admin action for user_id=%s", user_id)
+        if update.message:
+            await update.message.reply_text(
+                "Это действие доступно только администратору семьи. Отправьте /id владельцу бота, чтобы вас добавили в ADMIN_USER_IDS."
+            )
+
     def _restricted(
         self,
         callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]],
@@ -1703,6 +1717,21 @@ class FamilyPlannerBot:
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._is_access_allowed(update):
                 await self._deny_access(update)
+                return
+            await callback(update, context)
+
+        return wrapper
+
+    def _admin_restricted(
+        self,
+        callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]],
+    ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not self._is_access_allowed(update):
+                await self._deny_access(update)
+                return
+            if not self._is_admin_allowed(update):
+                await self._deny_admin_access(update)
                 return
             await callback(update, context)
 
@@ -1770,8 +1799,8 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
         app.add_handler(CommandHandler("digest", self._restricted(self.digest)))
         app.add_handler(CommandHandler("export", self._restricted(self.export_calendar)))
-        app.add_handler(CommandHandler("backup", self._restricted(self.backup)))
-        app.add_handler(CommandHandler("restore", self._restricted(self.restore)))
+        app.add_handler(CommandHandler("backup", self._admin_restricted(self.backup)))
+        app.add_handler(CommandHandler("restore", self._admin_restricted(self.restore)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))
