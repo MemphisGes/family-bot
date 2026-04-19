@@ -13,7 +13,8 @@ from .ai import FamilyAI
 from .config import Settings, load_settings
 from .db import Database
 from .parsing import parse_amount, parse_datetime, parse_recurrence, split_parts
-from .rendering import render_context, render_items
+from .db import Item
+from .rendering import KIND_LABELS, format_dt, render_context, render_items
 
 
 logging.basicConfig(
@@ -405,13 +406,57 @@ class FamilyPlannerBot:
         start = datetime.combine(now.date(), time.min)
         end = start + timedelta(days=1)
         items = self.db.list_window(update.effective_chat.id, start, end)
-        await update.message.reply_text(render_items("Сегодня", items), reply_markup=MENU_KEYBOARD)
+        await self._send_items_with_actions(update, "Сегодня", items)
 
     async def week(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         now = datetime.now()
         end = now + timedelta(days=7)
         items = self.db.list_window(update.effective_chat.id, now - timedelta(hours=1), end)
-        await update.message.reply_text(render_items("Ближайшие 7 дней", items), reply_markup=MENU_KEYBOARD)
+        await self._send_items_with_actions(update, "Ближайшие 7 дней", items)
+
+    async def _send_items_with_actions(self, update: Update, title: str, items: list[Item]) -> None:
+        if not items:
+            await update.effective_message.reply_text(f"{title}\nПока ничего нет.", reply_markup=MENU_KEYBOARD)
+            return
+        await update.effective_message.reply_text(title, reply_markup=MENU_KEYBOARD)
+        for item in items:
+            await update.effective_message.reply_html(
+                self._item_card_text(item),
+                reply_markup=self._item_actions_keyboard(item),
+            )
+
+    def _item_card_text(self, item: Item) -> str:
+        when = format_dt(item.starts_at or item.due_at)
+        lines = [
+            f"<b>{escape(KIND_LABELS.get(item.kind, item.kind.title()))}</b>",
+            f"#{item.id} {escape(when)}",
+            escape(item.title),
+        ]
+        if item.person:
+            lines.append(f"Кому: {self._format_person(item.person)}")
+        if item.category:
+            lines.append(f"Раздел: {escape(item.category)}")
+        if item.amount is not None:
+            lines.append(f"Сумма: {item.amount:g}")
+        if item.recurrence:
+            lines.append(f"Повтор: {escape(item.recurrence)}")
+        if item.notes:
+            lines.append(f"Комментарий: {escape(item.notes)}")
+        return "\n".join(lines)
+
+    def _item_actions_keyboard(self, item: Item) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Выполнено", callback_data=f"item:done:{item.id}"),
+                    InlineKeyboardButton("Изменить", callback_data=f"item:edit:{item.id}"),
+                ],
+                [
+                    InlineKeyboardButton("Перенести", callback_data=f"item:move:{item.id}"),
+                    InlineKeyboardButton("Удалить", callback_data=f"item:delete:{item.id}"),
+                ],
+            ]
+        )
 
     async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         question = " ".join(context.args).strip()
@@ -438,6 +483,7 @@ class FamilyPlannerBot:
             context.user_data.pop("flow", None)
             context.user_data.pop("constructor", None)
             context.user_data.pop("pending_confirmation", None)
+            context.user_data.pop("item_action", None)
             await update.message.reply_text("Ок, действие отменено.", reply_markup=MENU_KEYBOARD)
             return
 
@@ -463,6 +509,10 @@ class FamilyPlannerBot:
             await self._handle_constructor_input(update, context, text)
             return
 
+        if context.user_data.get("item_action"):
+            await self._handle_item_action_input(update, context, text)
+            return
+
         flow = context.user_data.pop("flow", None)
         if not flow:
             await update.message.reply_text(
@@ -472,6 +522,118 @@ class FamilyPlannerBot:
             return
 
         await self._handle_flow_input(update, context, flow, text)
+
+    async def handle_item_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        if not self._is_access_allowed(update):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+
+        parts = (query.data or "").split(":")
+        if len(parts) < 3:
+            await query.answer("Не понял действие", show_alert=True)
+            return
+        action = parts[1]
+        item_id = int(parts[2])
+        chat_id = query.message.chat_id
+        item = self.db.get_item(chat_id, item_id)
+        if not item:
+            await query.answer("Запись не найдена", show_alert=True)
+            await query.edit_message_text("Запись уже удалена или недоступна.")
+            return
+
+        if action == "done":
+            self.db.mark_done(chat_id, item_id)
+            await query.answer("Готово")
+            await query.edit_message_text(f"Выполнено: #{item_id} {item.title}")
+            await self._notify_family(update, self._build_notification(update, "Запись выполнена", item_id, item.title, item.person))
+            return
+
+        if action == "delete":
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Да, удалить", callback_data=f"item:delete_confirm:{item_id}"),
+                        InlineKeyboardButton("Отмена", callback_data=f"item:cancel:{item_id}"),
+                    ]
+                ]
+            )
+            await query.answer()
+            await query.edit_message_text(
+                f"Удалить запись #{item_id}?\n{item.title}",
+                reply_markup=keyboard,
+            )
+            return
+
+        if action == "delete_confirm":
+            deleted = self.db.delete_item(chat_id, item_id)
+            await query.answer("Удалено" if deleted else "Не найдено")
+            await query.edit_message_text(f"Удалено: #{item_id} {item.title}" if deleted else "Запись не найдена.")
+            if deleted:
+                await self._notify_family(update, self._build_notification(update, "Запись удалена", item_id, item.title, item.person))
+            return
+
+        if action == "cancel":
+            await query.answer()
+            await query.edit_message_text(self._item_card_text(item), parse_mode="HTML", reply_markup=self._item_actions_keyboard(item))
+            return
+
+        if action == "edit":
+            context.user_data["item_action"] = {"action": "edit", "item_id": item_id}
+            await query.answer()
+            await query.message.reply_text(
+                f"Введите новое название для #{item_id}.\nТекущее: {item.title}",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        if action == "move":
+            context.user_data["item_action"] = {"action": "move", "item_id": item_id}
+            await query.answer()
+            await query.message.reply_text(
+                f"Введите новую дату для #{item_id}.\nПример: завтра 18:30",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        await query.answer("Неизвестное действие", show_alert=True)
+
+    async def _handle_item_action_input(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+    ) -> None:
+        state = context.user_data.pop("item_action", None)
+        if not state:
+            return
+        chat_id = update.effective_chat.id
+        item_id = int(state["item_id"])
+        item = self.db.get_item(chat_id, item_id)
+        if not item:
+            await update.message.reply_text("Запись не найдена.", reply_markup=MENU_KEYBOARD)
+            return
+
+        if state["action"] == "edit":
+            title = text.strip()
+            if not title:
+                await update.message.reply_text("Название не может быть пустым.", reply_markup=MENU_KEYBOARD)
+                return
+            self.db.update_item_title(chat_id, item_id, title)
+            await update.message.reply_text(f"Изменено: #{item_id}", reply_markup=MENU_KEYBOARD)
+            await self._notify_family(update, self._build_notification(update, "Запись изменена", item_id, title, item.person))
+            return
+
+        if state["action"] == "move":
+            when = parse_datetime(text)
+            if not when:
+                await update.message.reply_text("Не понял дату. Пример: завтра 18:30", reply_markup=MENU_KEYBOARD)
+                return
+            self.db.reschedule_item(chat_id, item_id, when.isoformat(timespec="seconds"))
+            await update.message.reply_text(f"Перенесено: #{item_id} на {when.strftime('%d.%m %H:%M')}", reply_markup=MENU_KEYBOARD)
+            await self._notify_family(update, self._build_notification(update, "Запись перенесена", item_id, item.title, item.person, when))
+            return
+
+        await update.message.reply_text("Не понял действие с записью.", reply_markup=MENU_KEYBOARD)
 
     async def _handle_flow_input(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, flow: str, text: str
@@ -1034,6 +1196,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("ask", self._restricted(self.ask)))
         app.add_handler(CallbackQueryHandler(self.choose_member, pattern=r"^member:"))
         app.add_handler(CallbackQueryHandler(self.confirm_constructor, pattern=r"^confirm:"))
+        app.add_handler(CallbackQueryHandler(self.handle_item_action, pattern=r"^item:"))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._restricted(self.handle_menu_text)))
         app.job_queue.run_repeating(self.send_due_reminders, interval=60, first=5)
         return app

@@ -196,6 +196,42 @@ class Database:
             )
             return cur.rowcount > 0
 
+    def get_item(self, chat_id: int, item_id: int) -> Item | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM items WHERE chat_id = ? AND id = ?",
+                (chat_id, item_id),
+            ).fetchone()
+        return self._item_from_row(row) if row else None
+
+    def update_item_title(self, chat_id: int, item_id: int, title: str) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE items SET title = ? WHERE chat_id = ? AND id = ?",
+                (title, chat_id, item_id),
+            )
+            return cur.rowcount > 0
+
+    def reschedule_item(self, chat_id: int, item_id: int, when: str) -> bool:
+        item = self.get_item(chat_id, item_id)
+        if not item:
+            return False
+        field = "starts_at" if item.starts_at else "due_at"
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"UPDATE items SET {field} = ? WHERE chat_id = ? AND id = ?",
+                (when, chat_id, item_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_item(self, chat_id: int, item_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM items WHERE chat_id = ? AND id = ?",
+                (chat_id, item_id),
+            )
+            return cur.rowcount > 0
+
     def list_window(self, chat_id: int, start: datetime, end: datetime) -> list[Item]:
         start_s = start.isoformat(timespec="seconds")
         end_s = end.isoformat(timespec="seconds")
