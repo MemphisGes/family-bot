@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+from io import BytesIO
 from html import escape
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time, timedelta
@@ -159,7 +160,7 @@ class FamilyPlannerBot:
             "Можно также написать фразу обычным текстом, например: завтра в 18:00 у Маши стоматолог, "
             "и AI соберет запись на подтверждение. "
             "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
-            "Команды оставлены как запасной режим: /today, /week, /digest, /add, /ask, /done.",
+            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /add, /ask, /done.",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -439,6 +440,36 @@ class FamilyPlannerBot:
         answer = await self._build_digest_answer(update.effective_chat.id, title, start, end)
         await update.effective_message.reply_text(answer[:3900], reply_markup=MENU_KEYBOARD)
 
+    async def export_calendar(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        mode = (context.args[0].lower() if context.args else "").strip()
+        now = datetime.now()
+        days = 30
+        if mode in {"week", "неделя", "7"}:
+            days = 7
+        elif mode.isdigit():
+            days = min(180, max(1, int(mode)))
+
+        start = datetime.combine(now.date(), time.min)
+        end = start + timedelta(days=days)
+        items = self.db.list_window(update.effective_chat.id, start, end)
+        reminders = self.db.list_reminders_window(update.effective_chat.id, start, end)
+        content = self._build_ics(update.effective_chat.id, items, reminders)
+        if not content:
+            await update.effective_message.reply_text(
+                "За выбранный период нет записей с датой для экспорта.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        payload = BytesIO(content.encode("utf-8"))
+        payload.name = f"family-calendar-{now.strftime('%Y%m%d')}.ics"
+        await update.effective_message.reply_document(
+            document=payload,
+            filename=payload.name,
+            caption=f"Календарь семьи на {days} дн.",
+            reply_markup=MENU_KEYBOARD,
+        )
+
     async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         if not user:
@@ -543,6 +574,95 @@ class FamilyPlannerBot:
         when = format_dt(reminder["remind_at"])
         person = f" [{reminder['person']}]" if reminder["person"] else ""
         return f"#{reminder['id']} {when}{person}: {reminder['text']}"
+
+    def _build_ics(self, chat_id: int, items: list[Item], reminders: list) -> str:
+        dated_items = [item for item in items if item.starts_at or item.due_at]
+        if not dated_items and not reminders:
+            return ""
+
+        now_stamp = self._ics_dt(datetime.now())
+        lines = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Family Planner Bot//RU",
+            "CALSCALE:GREGORIAN",
+            "METHOD:PUBLISH",
+            "X-WR-CALNAME:Family Planner",
+        ]
+
+        for item in dated_items:
+            when_raw = item.starts_at or item.due_at
+            try:
+                starts_at = datetime.fromisoformat(when_raw or "")
+            except ValueError:
+                continue
+            duration = timedelta(hours=1) if item.starts_at else timedelta(minutes=30)
+            ends_at = starts_at + duration
+            details = []
+            if item.person:
+                details.append(f"Кому: {self._plain_person(item.person)}")
+            if item.category:
+                details.append(f"Раздел: {item.category}")
+            if item.notes:
+                details.append(f"Комментарий: {item.notes}")
+            lines.extend(
+                [
+                    "BEGIN:VEVENT",
+                    f"UID:item-{chat_id}-{item.id}-{self._ics_dt(starts_at)}@family-planner-bot",
+                    f"DTSTAMP:{now_stamp}",
+                    f"DTSTART:{self._ics_dt(starts_at)}",
+                    f"DTEND:{self._ics_dt(ends_at)}",
+                    f"SUMMARY:{self._ics_escape(KIND_LABELS.get(item.kind, item.kind.title()))}: {self._ics_escape(item.title)}",
+                ]
+            )
+            if details:
+                lines.append(f"DESCRIPTION:{self._ics_escape(chr(10).join(details))}")
+            lines.append("END:VEVENT")
+
+        for reminder in reminders:
+            try:
+                remind_at = datetime.fromisoformat(reminder["remind_at"])
+            except ValueError:
+                continue
+            details = f"Кому: {self._plain_person(reminder['person'])}" if reminder["person"] else ""
+            lines.extend(
+                [
+                    "BEGIN:VEVENT",
+                    f"UID:reminder-{chat_id}-{reminder['id']}-{self._ics_dt(remind_at)}@family-planner-bot",
+                    f"DTSTAMP:{now_stamp}",
+                    f"DTSTART:{self._ics_dt(remind_at)}",
+                    f"DTEND:{self._ics_dt(remind_at + timedelta(minutes=15))}",
+                    f"SUMMARY:{self._ics_escape('🔔 Напоминание')}: {self._ics_escape(reminder['text'])}",
+                ]
+            )
+            if details:
+                lines.append(f"DESCRIPTION:{self._ics_escape(details)}")
+            lines.append("END:VEVENT")
+
+        lines.append("END:VCALENDAR")
+        return "\r\n".join(lines) + "\r\n"
+
+    @staticmethod
+    def _ics_dt(value: datetime) -> str:
+        return value.strftime("%Y%m%dT%H%M%S")
+
+    @staticmethod
+    def _ics_escape(value: str) -> str:
+        return (
+            value.replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace("\r", "")
+            .replace(";", "\\;")
+            .replace(",", "\\,")
+        )
+
+    @staticmethod
+    def _plain_person(person: str | None) -> str:
+        if not person:
+            return ""
+        if person.startswith('<a href="tg://user?id=') and person.endswith("</a>"):
+            return person.split('">', 1)[-1].removesuffix("</a>")
+        return person
 
     async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         question = " ".join(context.args).strip()
@@ -1568,6 +1688,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("today", self._restricted(self.today)))
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
         app.add_handler(CommandHandler("digest", self._restricted(self.digest)))
+        app.add_handler(CommandHandler("export", self._restricted(self.export_calendar)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))
