@@ -79,6 +79,11 @@ CONSTRUCTORS = {
         ("title", "Что купить?\nПример: молоко"),
         ("notes", "Количество, магазин или комментарий? Напишите '-' если не нужно.\nПример: 2 л"),
     ],
+    "marketplace": [
+        ("title", "Что купить на маркетплейсе?\nПример: кроссовки ребенку"),
+        ("category", "Маркетплейс или категория? Напишите '-' если не нужно.\nПример: WB"),
+        ("notes", "Ссылка, цена или комментарий? Напишите '-' если не нужно."),
+    ],
     "wishlist": [
         ("person", "Чей вишлист?\nПример: Мама"),
         ("title", "Что добавить в вишлист?\nПример: массажер для спины"),
@@ -151,8 +156,10 @@ class FamilyPlannerBot:
         await update.message.reply_text(
             "Основной ввод теперь через меню быстрого доступа.\n\n"
             "Нажмите кнопку, затем отправьте данные по подсказке. "
+            "Можно также написать фразу обычным текстом, например: завтра в 18:00 у Маши стоматолог, "
+            "и AI соберет запись на подтверждение. "
             "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
-            "Команды оставлены как запасной режим: /today, /week, /ask, /done.",
+            "Команды оставлены как запасной режим: /today, /week, /add, /ask, /done.",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -485,6 +492,20 @@ class FamilyPlannerBot:
         question = " ".join(context.args).strip()
         await self._answer_ai(update, question)
 
+    async def add_from_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text(
+                "Формат: /add завтра в 18:00 у Маши стоматолог",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+        if not await self._create_ai_entry(update, context, text):
+            await update.message.reply_text(
+                "AI не настроен. Добавьте OPENAI_API_KEY в .env и перезапустите бота.",
+                reply_markup=MENU_KEYBOARD,
+            )
+
     async def _answer_ai(self, update: Update, question: str) -> None:
         if not question:
             await update.message.reply_text("Формат: /ask Что у нас завтра?")
@@ -496,6 +517,59 @@ class FamilyPlannerBot:
             LOGGER.exception("AI request failed")
             answer = "AI-помощник сейчас не ответил. Проверьте OPENAI_API_KEY, модель и доступ к API."
         await update.message.reply_text(answer[:3900], reply_markup=MENU_KEYBOARD)
+
+    async def _create_ai_entry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+    ) -> bool:
+        if not self.ai.is_enabled():
+            return False
+
+        members = [dict(row) for row in self.db.list_members(update.effective_chat.id)]
+        try:
+            parsed = await asyncio.to_thread(
+                self.ai.parse_family_entry,
+                text,
+                members,
+                datetime.now().strftime("%Y-%m-%d %H:%M"),
+            )
+        except Exception:
+            LOGGER.exception("AI entry parsing failed")
+            await update.message.reply_text(
+                "AI не смог разобрать запись. Попробуйте через кнопку меню или повторите фразу проще.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return True
+
+        flow = str(parsed.get("flow") or "").strip().lower()
+        if flow in {"", "null", "none"}:
+            clarification = str(parsed.get("clarification") or "Не понял, какую запись создать.")
+            await update.message.reply_text(clarification, reply_markup=MENU_KEYBOARD)
+            return True
+        if flow not in CONSTRUCTORS:
+            await update.message.reply_text(
+                "AI распознал неподдержанный тип записи. Используйте событие, задачу, покупку, маркетплейс, вишлист или напоминание.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return True
+
+        data = self._normalize_ai_constructor_data(flow, parsed, members)
+        errors = [
+            error
+            for field, _prompt in CONSTRUCTORS[flow]
+            if (error := self._validate_constructor_field(flow, field, data.get(field)))
+        ]
+        if errors:
+            await update.message.reply_text(
+                f"{errors[0]}\nМожно заполнить через кнопку меню или повторить фразу подробнее.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return True
+
+        context.user_data.pop("flow", None)
+        context.user_data.pop("constructor", None)
+        context.user_data.pop("pending_confirmation", None)
+        await self._show_constructor_confirmation(update, context, flow, data)
+        return True
 
     async def handle_menu_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (update.message.text or "").strip()
@@ -544,8 +618,10 @@ class FamilyPlannerBot:
 
         flow = context.user_data.pop("flow", None)
         if not flow:
+            if await self._create_ai_entry(update, context, text):
+                return
             await update.message.reply_text(
-                "Выберите действие в меню, затем отправьте данные.",
+                "Выберите действие в меню, затем отправьте данные. Если включен OPENAI_API_KEY, можно писать запись обычной фразой.",
                 reply_markup=MENU_KEYBOARD,
             )
             return
@@ -934,6 +1010,47 @@ class FamilyPlannerBot:
         ]
         return [str(value) for value in dict.fromkeys(values) if value]
 
+    def _normalize_ai_constructor_data(
+        self,
+        flow: str,
+        parsed: dict,
+        members: list[dict[str, str | None]],
+    ) -> dict[str, str | None]:
+        data: dict[str, str | None] = {}
+        for field, _prompt in CONSTRUCTORS[flow]:
+            value = parsed.get(field)
+            if value is None:
+                data[field] = None
+                continue
+            value_s = str(value).strip()
+            if not value_s or value_s.lower() in {"null", "none", "-"}:
+                data[field] = None
+                continue
+            data[field] = value_s
+
+        if "person" in data and data["person"]:
+            data["person"] = self._resolve_ai_person(data["person"], members)
+        if "recurrence" in data and data["recurrence"]:
+            data["recurrence"] = data["recurrence"].lower()
+        if "reminder" in data and data["reminder"]:
+            data["reminder"] = data["reminder"].lower()
+        return data
+
+    def _resolve_ai_person(
+        self, value: str, members: list[dict[str, str | None]]
+    ) -> str:
+        normalized = value.strip().lstrip("@").casefold()
+        for member in members:
+            candidates = [
+                member.get("name"),
+                member.get("username"),
+                f"@{member['username']}" if member.get("username") else None,
+                member.get("role"),
+            ]
+            if normalized in {str(candidate).strip().lstrip("@").casefold() for candidate in candidates if candidate}:
+                return self._member_display(member)
+        return value
+
     async def _show_constructor_confirmation(
         self,
         update: Update,
@@ -1003,6 +1120,7 @@ class FamilyPlannerBot:
             "event": "Проверьте событие",
             "task": "Проверьте задачу",
             "shopping": "Проверьте покупку",
+            "marketplace": "Проверьте покупку на маркетплейсе",
             "wishlist": "Проверьте вишлист",
             "reminder": "Проверьте напоминание",
         }
@@ -1151,6 +1269,31 @@ class FamilyPlannerBot:
                 "Добавлено в покупки",
                 notify_title="Новая покупка",
             )
+            return
+
+        if flow == "marketplace":
+            parts = [data.get("title"), data.get("category"), data.get("notes")]
+            text = " | ".join(part for part in parts if part)
+            item_id = self.db.add_item(
+                update.effective_chat.id,
+                "marketplace",
+                data["title"] or "",
+                category=data.get("category"),
+                notes=data.get("notes"),
+            )
+            await self._notify_family(
+                update,
+                self._build_notification(
+                    update,
+                    "Новая покупка на маркетплейсе",
+                    item_id,
+                    text,
+                    None,
+                    None,
+                    data.get("category"),
+                ),
+            )
+            await message.reply_html(f"Добавлено в покупки на маркетплейсах: #{item_id}", reply_markup=MENU_KEYBOARD)
             return
 
         if flow == "wishlist":
@@ -1349,6 +1492,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("week", self._restricted(self.week)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
+        app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))
         app.add_handler(CommandHandler("ask", self._restricted(self.ask)))
         app.add_handler(CallbackQueryHandler(self.choose_member, pattern=r"^member:"))
         app.add_handler(CallbackQueryHandler(self.choose_reminder_offset, pattern=r"^reminder_offset:"))
