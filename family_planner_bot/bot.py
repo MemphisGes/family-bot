@@ -162,7 +162,7 @@ class FamilyPlannerBot:
             "Можно также написать фразу обычным текстом, например: завтра в 18:00 у Маши стоматолог, "
             "и AI соберет запись на подтверждение. "
             "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
-            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /backup, /add, /ask, /done.",
+            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /backup, /restore, /add, /ask, /done.",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -491,6 +491,45 @@ class FamilyPlannerBot:
                     caption="Резервная копия семейного планера.",
                     reply_markup=MENU_KEYBOARD,
                 )
+
+    async def restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        reply = update.effective_message.reply_to_message if update.effective_message else None
+        document = reply.document if reply and reply.document else None
+        if not document:
+            await update.effective_message.reply_text(
+                "Чтобы восстановить базу, ответьте командой /restore на файл backup `.sqlite3`.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        filename = document.file_name or ""
+        if not filename.endswith(".sqlite3"):
+            await update.effective_message.reply_text(
+                "Нужен файл `.sqlite3`, созданный командой /backup.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safety_path = Path("restore-safety") / f"before-restore-{timestamp}.sqlite3"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            restore_path = Path(temp_dir) / "restore.sqlite3"
+            try:
+                telegram_file = await document.get_file()
+                await telegram_file.download_to_drive(custom_path=restore_path)
+                await asyncio.to_thread(self.db.restore_from, restore_path, safety_path)
+            except Exception:
+                LOGGER.exception("Failed to restore database backup")
+                await update.effective_message.reply_text(
+                    "Не смог восстановить базу. Файл не похож на корректный backup семейного планера.",
+                    reply_markup=MENU_KEYBOARD,
+                )
+                return
+
+        await update.effective_message.reply_text(
+            f"База восстановлена. Safety-копия предыдущей базы: {safety_path}",
+            reply_markup=MENU_KEYBOARD,
+        )
 
     async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -1732,6 +1771,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("digest", self._restricted(self.digest)))
         app.add_handler(CommandHandler("export", self._restricted(self.export_calendar)))
         app.add_handler(CommandHandler("backup", self._restricted(self.backup)))
+        app.add_handler(CommandHandler("restore", self._restricted(self.restore)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))

@@ -47,6 +47,51 @@ class Database:
             target.close()
             source.close()
 
+    def restore_from(self, source_path: Path, safety_backup_path: Path) -> None:
+        self._validate_backup(source_path)
+        self.backup_to(safety_backup_path)
+        source = sqlite3.connect(source_path)
+        target = sqlite3.connect(self.path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        self.init_schema()
+
+    @staticmethod
+    def _validate_backup(source_path: Path) -> None:
+        required_tables = {"members", "items", "reminders"}
+        required_columns = {
+            "members": {"chat_id", "name", "created_at"},
+            "items": {"chat_id", "kind", "title", "created_at"},
+            "reminders": {"chat_id", "text", "remind_at", "created_at"},
+        }
+        conn = sqlite3.connect(source_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            if not result or result[0] != "ok":
+                raise ValueError("backup integrity check failed")
+
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            tables = {str(row["name"]) for row in rows}
+            missing_tables = required_tables - tables
+            if missing_tables:
+                raise ValueError(f"backup missing tables: {', '.join(sorted(missing_tables))}")
+
+            for table, columns in required_columns.items():
+                found = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                missing_columns = columns - found
+                if missing_columns:
+                    raise ValueError(
+                        f"backup table {table} missing columns: {', '.join(sorted(missing_columns))}"
+                    )
+        finally:
+            conn.close()
+
     @contextmanager
     def connect(self) -> Iterable[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
