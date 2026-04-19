@@ -312,6 +312,20 @@ class Database:
             ).fetchall()
         return [self._item_from_row(row) for row in rows]
 
+    def list_known_chat_ids(self) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT chat_id FROM items
+                UNION
+                SELECT chat_id FROM reminders
+                UNION
+                SELECT chat_id FROM members
+                ORDER BY chat_id
+                """
+            ).fetchall()
+        return [int(row["chat_id"]) for row in rows]
+
     def add_reminder(self, chat_id: int, remind_at: str, text: str, person: str | None) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         with self.connect() as conn:

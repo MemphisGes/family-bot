@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, time
 
 from dotenv import load_dotenv
 
@@ -13,6 +14,8 @@ class Settings:
     openai_model: str
     database_path: str
     reminder_lookahead_minutes: int
+    daily_digest_time: time | None
+    daily_digest_chat_ids: frozenset[int]
     allowed_chat_ids: frozenset[int]
     allowed_user_ids: frozenset[int]
 
@@ -36,6 +39,8 @@ def load_settings() -> Settings:
         database_path=os.getenv("DATABASE_PATH", "family_planner.sqlite3").strip()
         or "family_planner.sqlite3",
         reminder_lookahead_minutes=lookahead,
+        daily_digest_time=_parse_time(os.getenv("DAILY_DIGEST_TIME", "")),
+        daily_digest_chat_ids=_parse_int_set(os.getenv("DAILY_DIGEST_CHAT_IDS", "")),
         allowed_chat_ids=_parse_int_set(os.getenv("ALLOWED_CHAT_IDS", "")),
         allowed_user_ids=_parse_int_set(os.getenv("ALLOWED_USER_IDS", "")),
     )
@@ -52,3 +57,18 @@ def _parse_int_set(raw: str) -> frozenset[int]:
         except ValueError:
             raise RuntimeError(f"Invalid numeric id in allowlist: {part}") from None
     return frozenset(values)
+
+
+def _parse_time(raw: str) -> time | None:
+    value = raw.strip()
+    if not value:
+        return None
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise RuntimeError(f"Invalid time value: {value}. Expected HH:MM")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        return time(hour=hour, minute=minute, tzinfo=datetime.now().astimezone().tzinfo)
+    except ValueError:
+        raise RuntimeError(f"Invalid time value: {value}. Expected HH:MM") from None

@@ -436,23 +436,7 @@ class FamilyPlannerBot:
             end = start + timedelta(days=1)
             title = "Семейный дайджест на сегодня"
 
-        items = self.db.list_window(update.effective_chat.id, start, end)
-        reminders = self.db.list_reminders_window(update.effective_chat.id, start, end)
-        context_text = self._digest_context(title, items, reminders)
-
-        if self.ai.is_enabled():
-            question = (
-                "Составь короткий семейный дайджест на русском: сначала главное на сегодня или неделю, "
-                "потом риски/что подготовить, потом покупки и напоминания. Без длинных вступлений."
-            )
-            try:
-                answer = await asyncio.to_thread(self.ai.answer, question, context_text)
-            except Exception:
-                LOGGER.exception("AI digest failed")
-                answer = self._fallback_digest(title, items, reminders)
-        else:
-            answer = self._fallback_digest(title, items, reminders)
-
+        answer = await self._build_digest_answer(update.effective_chat.id, title, start, end)
         await update.effective_message.reply_text(answer[:3900], reply_markup=MENU_KEYBOARD)
 
     async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -518,6 +502,26 @@ class FamilyPlannerBot:
                 ],
             ]
         )
+
+    async def _build_digest_answer(
+        self, chat_id: int, title: str, start: datetime, end: datetime
+    ) -> str:
+        items = self.db.list_window(chat_id, start, end)
+        reminders = self.db.list_reminders_window(chat_id, start, end)
+        context_text = self._digest_context(title, items, reminders)
+
+        if not self.ai.is_enabled():
+            return self._fallback_digest(title, items, reminders)
+
+        question = (
+            "Составь короткий семейный дайджест на русском: сначала главное на сегодня или неделю, "
+            "потом риски/что подготовить, потом покупки и напоминания. Без длинных вступлений."
+        )
+        try:
+            return await asyncio.to_thread(self.ai.answer, question, context_text)
+        except Exception:
+            LOGGER.exception("AI digest failed")
+            return self._fallback_digest(title, items, reminders)
 
     def _digest_context(self, title: str, items: list[Item], reminders: list) -> str:
         lines = [title, "", render_context(items)]
@@ -1517,6 +1521,27 @@ class FamilyPlannerBot:
             except Exception:
                 LOGGER.exception("Failed to send reminder %s", reminder["id"])
 
+    async def send_daily_digest(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_ids = self.settings.daily_digest_chat_ids or frozenset(self.db.list_known_chat_ids())
+        if not chat_ids:
+            LOGGER.info("Daily digest skipped: no target chats")
+            return
+
+        now = datetime.now()
+        start = datetime.combine(now.date(), time.min)
+        end = start + timedelta(days=1)
+        for chat_id in sorted(chat_ids):
+            try:
+                answer = await self._build_digest_answer(
+                    chat_id,
+                    "Семейный дайджест на сегодня",
+                    start,
+                    end,
+                )
+                await context.bot.send_message(chat_id=chat_id, text=answer[:3900])
+            except Exception:
+                LOGGER.exception("Failed to send daily digest to chat %s", chat_id)
+
     def build_application(self) -> Application:
         app = Application.builder().token(self.settings.telegram_bot_token).build()
         if not self.settings.allowed_chat_ids and not self.settings.allowed_user_ids:
@@ -1553,6 +1578,8 @@ class FamilyPlannerBot:
         app.add_handler(CallbackQueryHandler(self.handle_item_action, pattern=r"^item:"))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._restricted(self.handle_menu_text)))
         app.job_queue.run_repeating(self.send_due_reminders, interval=60, first=5)
+        if self.settings.daily_digest_time:
+            app.job_queue.run_daily(self.send_daily_digest, time=self.settings.daily_digest_time)
         return app
 
 
