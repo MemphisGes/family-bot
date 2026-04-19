@@ -152,6 +152,21 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_reminders_pending
                     ON reminders(chat_id, remind_at, sent_at);
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    actor_user_id INTEGER,
+                    actor_name TEXT,
+                    action TEXT NOT NULL,
+                    target_type TEXT,
+                    target_id INTEGER,
+                    description TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audit_chat_created
+                    ON audit_log(chat_id, created_at);
                 """
             )
             self._ensure_column(conn, "members", "telegram_user_id", "INTEGER")
@@ -408,6 +423,54 @@ class Database:
                 """
             ).fetchall()
         return [int(row["chat_id"]) for row in rows]
+
+    def add_audit(
+        self,
+        chat_id: int,
+        actor_user_id: int | None,
+        actor_name: str | None,
+        action: str,
+        target_type: str | None = None,
+        target_id: int | None = None,
+        description: str | None = None,
+    ) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO audit_log(
+                    chat_id, actor_user_id, actor_name, action, target_type,
+                    target_id, description, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    actor_user_id,
+                    actor_name,
+                    action,
+                    target_type,
+                    target_id,
+                    description,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_audit(self, chat_id: int, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, actor_user_id, actor_name, action, target_type,
+                       target_id, description, created_at
+                FROM audit_log
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+        return list(rows)
 
     def add_reminder(self, chat_id: int, remind_at: str, text: str, person: str | None) -> int:
         now = datetime.now().isoformat(timespec="seconds")

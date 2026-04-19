@@ -162,7 +162,7 @@ class FamilyPlannerBot:
             "Можно также написать фразу обычным текстом, например: завтра в 18:00 у Маши стоматолог, "
             "и AI соберет запись на подтверждение. "
             "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
-            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /backup, /restore, /add, /ask, /done.",
+            "Команды оставлены как запасной режим: /today, /week, /digest, /export, /backup, /restore, /audit, /add, /ask, /done.",
             reply_markup=MENU_KEYBOARD,
         )
 
@@ -193,6 +193,7 @@ class FamilyPlannerBot:
             username=user.username,
             mention=user.mention_html(),
         )
+        self._audit(update, "create", "member", None, name)
         await update.message.reply_html(
             f"Добавлен член семьи: {user.mention_html()} как {name}",
             reply_markup=MENU_KEYBOARD,
@@ -251,6 +252,7 @@ class FamilyPlannerBot:
             category=category,
             recurrence=recurrence,
         )
+        self._audit(update, "create", kind, item_id, title)
         await self._notify_family(
             update,
             self._build_notification(
@@ -313,6 +315,7 @@ class FamilyPlannerBot:
         notify_title: str | None = None,
     ) -> int:
         item_id = self.db.add_item(update.effective_chat.id, kind, text)
+        self._audit(update, "create", kind, item_id, text)
         if notify_title:
             await self._notify_family(update, self._build_notification(update, notify_title, item_id, text))
         await update.effective_message.reply_text(f"{reply_title}: #{item_id}", reply_markup=MENU_KEYBOARD)
@@ -342,6 +345,7 @@ class FamilyPlannerBot:
             amount=amount,
             category=parts[3],
         )
+        self._audit(update, "create", "expense", item_id, notes or parts[3])
         await self._notify_family(
             update,
             self._build_notification(update, "Новая финансовая запись", item_id, notes or parts[3], parts[1], when, parts[3]),
@@ -368,6 +372,7 @@ class FamilyPlannerBot:
             starts_at=when.isoformat(timespec="seconds"),
             category=parts[1],
         )
+        self._audit(update, "create", "menu", item_id, parts[2])
         await self._notify_family(update, self._build_notification(update, "Новое меню", item_id, parts[2], None, when, parts[1]))
         await update.message.reply_text(f"Добавлено в меню: #{item_id}", reply_markup=MENU_KEYBOARD)
 
@@ -401,6 +406,7 @@ class FamilyPlannerBot:
             parts[2],
             parts[1],
         )
+        self._audit(update, "create", "reminder", reminder_id, parts[2])
         await self._notify_family(update, self._build_notification(update, "Новое напоминание", reminder_id, parts[2], parts[1], when))
         await update.message.reply_text(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
 
@@ -409,6 +415,9 @@ class FamilyPlannerBot:
             await update.message.reply_text("Формат: /done ID")
             return
         result = self.db.complete_item(update.effective_chat.id, int(context.args[0]))
+        if result.found:
+            action = "advance" if result.advanced else "complete"
+            self._audit(update, action, "item", int(context.args[0]), result.next_at)
         await update.message.reply_text(self._completion_text(result), reply_markup=MENU_KEYBOARD)
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -491,6 +500,7 @@ class FamilyPlannerBot:
                     caption="Резервная копия семейного планера.",
                     reply_markup=MENU_KEYBOARD,
                 )
+        self._audit(update, "backup", "database", None, filename)
 
     async def restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply = update.effective_message.reply_to_message if update.effective_message else None
@@ -526,10 +536,32 @@ class FamilyPlannerBot:
                 )
                 return
 
+        self._audit(update, "restore", "database", None, str(safety_path))
         await update.effective_message.reply_text(
             f"База восстановлена. Safety-копия предыдущей базы: {safety_path}",
             reply_markup=MENU_KEYBOARD,
         )
+
+    async def audit_log(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        limit = 20
+        if context.args and context.args[0].isdigit():
+            limit = min(50, max(1, int(context.args[0])))
+        rows = self.db.list_audit(update.effective_chat.id, limit)
+        if not rows:
+            await update.effective_message.reply_text("Журнал действий пока пуст.", reply_markup=MENU_KEYBOARD)
+            return
+        lines = ["Журнал действий:"]
+        for row in rows:
+            when = format_dt(row["created_at"])
+            actor = row["actor_name"] or str(row["actor_user_id"] or "unknown")
+            target = ""
+            if row["target_type"]:
+                target = f" {row['target_type']}"
+                if row["target_id"] is not None:
+                    target += f" #{row['target_id']}"
+            description = f" - {row['description']}" if row["description"] else ""
+            lines.append(f"{when} {actor}: {row['action']}{target}{description}")
+        await update.effective_message.reply_text("\n".join(lines)[:3900], reply_markup=MENU_KEYBOARD)
 
     async def my_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -909,6 +941,9 @@ class FamilyPlannerBot:
 
         if action == "done":
             result = self.db.complete_item(chat_id, item_id)
+            if result.found:
+                audit_action = "advance" if result.advanced else "complete"
+                self._audit(update, audit_action, "item", item_id, result.next_at or item.title)
             await query.answer("Готово")
             await query.edit_message_text(self._completion_text(result, item))
             notify_title = "Повтор перенесен" if result.advanced else "Запись выполнена"
@@ -937,6 +972,7 @@ class FamilyPlannerBot:
             await query.answer("Удалено" if deleted else "Не найдено")
             await query.edit_message_text(f"Удалено: #{item_id} {item.title}" if deleted else "Запись не найдена.")
             if deleted:
+                self._audit(update, "delete", item.kind, item_id, item.title)
                 await self._notify_family(update, self._build_notification(update, "Запись удалена", item_id, item.title, item.person))
             return
 
@@ -984,6 +1020,7 @@ class FamilyPlannerBot:
                 await update.message.reply_text("Название не может быть пустым.", reply_markup=MENU_KEYBOARD)
                 return
             self.db.update_item_title(chat_id, item_id, title)
+            self._audit(update, "edit", item.kind, item_id, f"{item.title} -> {title}")
             await update.message.reply_text(f"Изменено: #{item_id}", reply_markup=MENU_KEYBOARD)
             await self._notify_family(update, self._build_notification(update, "Запись изменена", item_id, title, item.person))
             return
@@ -994,6 +1031,7 @@ class FamilyPlannerBot:
                 await update.message.reply_text("Не понял дату. Пример: завтра 18:30", reply_markup=MENU_KEYBOARD)
                 return
             self.db.reschedule_item(chat_id, item_id, when.isoformat(timespec="seconds"))
+            self._audit(update, "move", item.kind, item_id, when.isoformat(timespec="seconds"))
             await update.message.reply_text(f"Перенесено: #{item_id} на {when.strftime('%d.%m %H:%M')}", reply_markup=MENU_KEYBOARD)
             await self._notify_family(update, self._build_notification(update, "Запись перенесена", item_id, item.title, item.person, when))
             return
@@ -1078,6 +1116,9 @@ class FamilyPlannerBot:
                 await update.message.reply_text("Нужен числовой ID записи.", reply_markup=MENU_KEYBOARD)
                 return
             result = self.db.complete_item(update.effective_chat.id, int(text))
+            if result.found:
+                action = "advance" if result.advanced else "complete"
+                self._audit(update, action, "item", int(text), result.next_at)
             await update.message.reply_text(self._completion_text(result), reply_markup=MENU_KEYBOARD)
             return
 
@@ -1499,6 +1540,9 @@ class FamilyPlannerBot:
                 reminder_offset,
                 flow,
             )
+            self._audit(update, "create", kind, item_id, title)
+            if reminder_id:
+                self._audit(update, "create", "reminder", reminder_id, f"relative reminder for {kind} #{item_id}")
             await self._notify_family(
                 update,
                 self._build_notification(
@@ -1538,6 +1582,7 @@ class FamilyPlannerBot:
                 category=data.get("category"),
                 notes=data.get("notes"),
             )
+            self._audit(update, "create", "marketplace", item_id, text)
             await self._notify_family(
                 update,
                 self._build_notification(
@@ -1564,6 +1609,7 @@ class FamilyPlannerBot:
                 category=data.get("category"),
                 notes=data.get("notes"),
             )
+            self._audit(update, "create", "wishlist", item_id, text)
             await self._notify_family(
                 update,
                 self._build_notification(
@@ -1590,6 +1636,7 @@ class FamilyPlannerBot:
                 data["title"] or "",
                 data.get("person"),
             )
+            self._audit(update, "create", "reminder", reminder_id, data["title"] or "")
             await self._notify_family(
                 update,
                 self._build_notification(
@@ -1615,6 +1662,7 @@ class FamilyPlannerBot:
         color: str | None,
     ) -> None:
         self.db.add_member(chat_id, name, role, color)
+        self._audit(update, "create", "member", None, name)
         await update.message.reply_text(f"Добавлено: {name}", reply_markup=MENU_KEYBOARD)
 
     async def _save_reminder_from_text(self, update: Update, text: str) -> None:
@@ -1633,6 +1681,7 @@ class FamilyPlannerBot:
             parts[2],
             parts[1],
         )
+        self._audit(update, "create", "reminder", reminder_id, parts[2])
         await self._notify_family(update, self._build_notification(update, "Новое напоминание", reminder_id, parts[2], parts[1], when))
         await update.message.reply_text(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
 
@@ -1674,6 +1723,31 @@ class FamilyPlannerBot:
         if not user:
             return None
         return user.full_name or user.username
+
+    def _audit(
+        self,
+        update: Update,
+        action: str,
+        target_type: str | None = None,
+        target_id: int | None = None,
+        description: str | None = None,
+    ) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat:
+            return
+        try:
+            self.db.add_audit(
+                chat.id,
+                user.id if user else None,
+                self._author_name(update),
+                action,
+                target_type,
+                target_id,
+                description,
+            )
+        except Exception:
+            LOGGER.exception("Failed to write audit log")
 
     def _is_access_allowed(self, update: Update) -> bool:
         if not self.settings.allowed_chat_ids and not self.settings.allowed_user_ids:
@@ -1801,6 +1875,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("export", self._restricted(self.export_calendar)))
         app.add_handler(CommandHandler("backup", self._admin_restricted(self.backup)))
         app.add_handler(CommandHandler("restore", self._admin_restricted(self.restore)))
+        app.add_handler(CommandHandler("audit", self._admin_restricted(self.audit_log)))
         app.add_handler(CommandHandler("my", self._restricted(self.my_tasks)))
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("add", self._restricted(self.add_from_text)))
