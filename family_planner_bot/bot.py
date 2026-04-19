@@ -65,6 +65,7 @@ CONSTRUCTORS = {
         ("title", "Что за событие?\nПример: врач"),
         ("category", "Раздел или категория? Напишите '-' если не нужно.\nПример: health"),
         ("recurrence", "Повторять? Напишите daily, weekly, monthly или '-'."),
+        ("reminder", "Напомнить заранее? Напишите 10m, 1h, 1d или '-'."),
     ],
     "task": [
         ("date", "К какому сроку задача?\nПример: пятница 19:00"),
@@ -72,6 +73,7 @@ CONSTRUCTORS = {
         ("title", "Что нужно сделать?\nПример: оплатить ЖКУ"),
         ("category", "Раздел или категория? Напишите '-' если не нужно.\nПример: finance"),
         ("recurrence", "Повторять? Напишите daily, weekly, monthly или '-'."),
+        ("reminder", "Напомнить заранее? Напишите 10m, 1h, 1d или '-'."),
     ],
     "shopping": [
         ("title", "Что купить?\nПример: молоко"),
@@ -772,6 +774,24 @@ class FamilyPlannerBot:
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
                 return
+        if field == "reminder":
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("За 10 минут", callback_data="reminder_offset:10m"),
+                        InlineKeyboardButton("За 1 час", callback_data="reminder_offset:1h"),
+                    ],
+                    [
+                        InlineKeyboardButton("За 1 день", callback_data="reminder_offset:1d"),
+                        InlineKeyboardButton("Не напоминать", callback_data="reminder_offset:none"),
+                    ],
+                ]
+            )
+            await update.message.reply_text(
+                self._constructor_prompt(flow, step),
+                reply_markup=keyboard,
+            )
+            return
         await update.message.reply_text(
             self._constructor_prompt(flow, step),
             reply_markup=MENU_KEYBOARD,
@@ -800,6 +820,44 @@ class FamilyPlannerBot:
             state["step"] = step
             context.user_data["constructor"] = state
             await self._send_constructor_step(update, context, flow, step)
+            return
+
+        context.user_data.pop("constructor", None)
+        await self._show_constructor_confirmation(update, context, flow, state["data"])
+
+    async def choose_reminder_offset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        if not self._is_access_allowed(update):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+
+        state = context.user_data.get("constructor")
+        if not state:
+            await query.answer("Конструктор уже закрыт", show_alert=True)
+            return
+
+        flow = state["flow"]
+        step = int(state["step"])
+        field, _prompt = CONSTRUCTORS[flow][step]
+        if field != "reminder":
+            await query.answer("Сейчас выбирается другое поле", show_alert=True)
+            return
+
+        value = (query.data or "").removeprefix("reminder_offset:")
+        state["data"][field] = None if value == "none" else value
+        step += 1
+        await query.answer()
+        await query.edit_message_text(f"Напоминание: {self._reminder_label(state['data'][field])}")
+
+        if step < len(CONSTRUCTORS[flow]):
+            state["step"] = step
+            context.user_data["constructor"] = state
+            await query.message.reply_text(
+                self._constructor_prompt(flow, step),
+                reply_markup=MENU_KEYBOARD,
+            )
             return
 
         context.user_data.pop("constructor", None)
@@ -954,6 +1012,7 @@ class FamilyPlannerBot:
             "title": "Что",
             "category": "Категория",
             "recurrence": "Повтор",
+            "reminder": "Напомнить",
             "notes": "Комментарий",
         }
         lines = [f"<b>{escape(labels.get(flow, 'Проверьте запись'))}</b>"]
@@ -965,7 +1024,12 @@ class FamilyPlannerBot:
                 parsed = parse_datetime(value)
                 value = parsed.strftime("%d.%m %H:%M") if parsed else value
             label = escape(field_labels.get(field, field))
-            formatted = self._format_person(value) if field == "person" else escape(value)
+            if field == "person":
+                formatted = self._format_person(value)
+            elif field == "reminder":
+                formatted = escape(self._reminder_label(value))
+            else:
+                formatted = escape(value)
             lines.append(f"{label}: {formatted}")
         lines.append("")
         lines.append("Сохранить запись?")
@@ -980,7 +1044,51 @@ class FamilyPlannerBot:
             return "Не понял дату. Пример: завтра 18:30"
         if field == "recurrence" and value and value.lower() not in {"daily", "weekly", "monthly"}:
             return "Повтор должен быть daily, weekly, monthly или '-'."
+        if field == "reminder" and value and value.lower() not in {"10m", "1h", "1d"}:
+            return "Напоминание должно быть 10m, 1h, 1d или '-'."
         return None
+
+    def _reminder_label(self, value: str | None) -> str:
+        labels = {
+            "10m": "за 10 минут",
+            "1h": "за 1 час",
+            "1d": "за 1 день",
+            None: "не напоминать",
+        }
+        return labels.get(value, value or "не напоминать")
+
+    def _reminder_delta(self, value: str | None) -> timedelta | None:
+        if value == "10m":
+            return timedelta(minutes=10)
+        if value == "1h":
+            return timedelta(hours=1)
+        if value == "1d":
+            return timedelta(days=1)
+        return None
+
+    def _create_relative_reminder(
+        self,
+        chat_id: int,
+        target_time: datetime,
+        title: str,
+        person: str | None,
+        offset: str | None,
+        flow: str,
+    ) -> int | None:
+        delta = self._reminder_delta(offset)
+        if not delta:
+            return None
+        remind_at = target_time - delta
+        if remind_at <= datetime.now():
+            return None
+        target_label = "задачи" if flow == "task" else "события"
+        text = f"{title} ({self._reminder_label(offset)} до {target_label})"
+        return self.db.add_reminder(
+            chat_id,
+            remind_at.isoformat(timespec="seconds"),
+            text,
+            person,
+        )
 
     async def _save_constructor_result(
         self, update: Update, flow: str, data: dict[str, str | None]
@@ -997,6 +1105,7 @@ class FamilyPlannerBot:
             person = data["person"]
             category = data.get("category")
             recurrence = data.get("recurrence")
+            reminder_offset = data.get("reminder")
             item_id = self.db.add_item(
                 update.effective_chat.id,
                 kind,
@@ -1006,6 +1115,14 @@ class FamilyPlannerBot:
                 due_at=when.isoformat(timespec="seconds") if flow == "task" else None,
                 category=category,
                 recurrence=recurrence.lower() if recurrence else None,
+            )
+            reminder_id = self._create_relative_reminder(
+                update.effective_chat.id,
+                when,
+                title,
+                person,
+                reminder_offset,
+                flow,
             )
             await self._notify_family(
                 update,
@@ -1019,7 +1136,8 @@ class FamilyPlannerBot:
                     category,
                 ),
             )
-            await message.reply_html(f"Добавлено: {label} #{item_id}", reply_markup=MENU_KEYBOARD)
+            reminder_text = f"\nНапоминание: #{reminder_id}" if reminder_id else ""
+            await message.reply_html(f"Добавлено: {label} #{item_id}{reminder_text}", reply_markup=MENU_KEYBOARD)
             return
 
         if flow == "shopping":
@@ -1233,6 +1351,7 @@ class FamilyPlannerBot:
         app.add_handler(CommandHandler("tasks", self._restricted(self.all_tasks)))
         app.add_handler(CommandHandler("ask", self._restricted(self.ask)))
         app.add_handler(CallbackQueryHandler(self.choose_member, pattern=r"^member:"))
+        app.add_handler(CallbackQueryHandler(self.choose_reminder_offset, pattern=r"^reminder_offset:"))
         app.add_handler(CallbackQueryHandler(self.confirm_constructor, pattern=r"^confirm:"))
         app.add_handler(CallbackQueryHandler(self.handle_item_action, pattern=r"^item:"))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._restricted(self.handle_menu_text)))
