@@ -1,0 +1,949 @@
+from __future__ import annotations
+
+import logging
+import asyncio
+from html import escape
+from collections.abc import Awaitable, Callable
+from datetime import datetime, time, timedelta
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+from .ai import FamilyAI
+from .config import Settings, load_settings
+from .db import Database
+from .parsing import parse_amount, parse_datetime, parse_recurrence, split_parts
+from .rendering import render_context, render_items
+
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+LOGGER = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+NOTIFICATION_TITLES = {
+    "event": "Новое событие",
+    "booking": "Новая бронь",
+    "task": "Новая задача",
+}
+
+
+MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["☀️ Сегодня", "📅 Неделя"],
+        ["🗓️ Событие", "✅ Задача", "🛒 Покупки"],
+        ["🎁 Вишлист", "🔔 Напоминание"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие",
+)
+
+FLOW_PROMPTS = {
+    "member": "Введите: Имя роль цвет\nПример: Мама parent #ff6b6b",
+    "event": "Введите: дата | кто | что | категория | daily/weekly/monthly\nПример: завтра 18:30 | Мама | врач | health",
+    "booking": "Введите: дата | кто | что забронировали | детали\nПример: суббота 15:00 | семья | столик в кафе | 4 человека",
+    "task": "Введите: дата | кто | что | категория | daily/weekly/monthly\nПример: пятница 19:00 | Папа | оплатить ЖКУ | finance",
+    "reminder": "Введите: дата | кто | текст\nПример: завтра 09:00 | Мама | взять документы",
+    "shopping": "Введите покупку.\nПример: молоко 2 л",
+    "marketplace": "Введите покупку на маркетплейсе.\nПример: WB | кроссовки ребенку | 3200 | ссылка или комментарий",
+    "wishlist": "Введите желание.\nПример: Мама | массажер для спины | день рождения | ссылка или комментарий",
+    "expense": "Введите: дата | кто | сумма | категория | комментарий\nПример: завтра | семья | 4500 | ЖКУ | коммунальные платежи",
+    "menu": "Введите: дата | прием пищи | блюдо\nПример: понедельник | ужин | паста и салат",
+    "note": "Введите текст заметки.",
+    "ai": "Введите вопрос AI-помощнику.\nПример: Что у нас завтра и что подготовить вечером?",
+    "done": "Введите ID записи, которую нужно закрыть.\nПример: 12",
+}
+
+CONSTRUCTORS = {
+    "event": [
+        ("date", "Когда событие?\nПример: завтра 18:30"),
+        ("person", "Для кого событие?\nПример: Мама"),
+        ("title", "Что за событие?\nПример: врач"),
+        ("category", "Раздел или категория? Напишите '-' если не нужно.\nПример: health"),
+        ("recurrence", "Повторять? Напишите daily, weekly, monthly или '-'."),
+    ],
+    "task": [
+        ("date", "К какому сроку задача?\nПример: пятница 19:00"),
+        ("person", "Кому задача?\nПример: Папа"),
+        ("title", "Что нужно сделать?\nПример: оплатить ЖКУ"),
+        ("category", "Раздел или категория? Напишите '-' если не нужно.\nПример: finance"),
+        ("recurrence", "Повторять? Напишите daily, weekly, monthly или '-'."),
+    ],
+    "shopping": [
+        ("title", "Что купить?\nПример: молоко"),
+        ("notes", "Количество, магазин или комментарий? Напишите '-' если не нужно.\nПример: 2 л"),
+    ],
+    "wishlist": [
+        ("person", "Чей вишлист?\nПример: Мама"),
+        ("title", "Что добавить в вишлист?\nПример: массажер для спины"),
+        ("category", "Повод или категория? Напишите '-' если не нужно.\nПример: день рождения"),
+        ("notes", "Ссылка или комментарий? Напишите '-' если не нужно."),
+    ],
+    "reminder": [
+        ("date", "Когда напомнить?\nПример: завтра 09:00"),
+        ("person", "Кому напомнить?\nПример: Мама"),
+        ("title", "О чем напомнить?\nПример: взять документы в школу"),
+    ],
+}
+
+MENU_TO_FLOW = {
+    "Семья": "member",
+    "Событие": "event",
+    "🗓️ Событие": "event",
+    "Бронь": "booking",
+    "Задача": "task",
+    "✅ Задача": "task",
+    "Покупки": "shopping",
+    "🛒 Покупки": "shopping",
+    "Напоминание": "reminder",
+    "🔔 Напоминание": "reminder",
+    "Покупка": "shopping",
+    "Маркетплейс": "marketplace",
+    "Вишлист": "wishlist",
+    "🎁 Вишлист": "wishlist",
+    "Финансы": "expense",
+    "Меню": "menu",
+    "Заметка": "note",
+    "AI": "ai",
+    "Закрыть ID": "done",
+}
+
+
+class FamilyPlannerBot:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.db = Database(settings.database_path)
+        self.ai = FamilyAI(settings.openai_api_key, settings.openai_model)
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(
+            "Семейный планер готов. Выберите действие в меню быстрого доступа.",
+            reply_markup=MENU_KEYBOARD,
+        )
+
+    async def show_ids(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        lines = ["ID для настройки доступа:"]
+        if chat:
+            lines.append(f"chat_id: {chat.id}")
+        if user:
+            lines.append(f"user_id: {user.id}")
+        lines.append("")
+        lines.append("Добавьте нужные значения в ALLOWED_CHAT_IDS или ALLOWED_USER_IDS в .env.")
+        await update.message.reply_text("\n".join(lines))
+
+    async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.user_data.pop("flow", None)
+        context.user_data.pop("constructor", None)
+        await update.message.reply_text(
+            "Меню обновлено.",
+            reply_markup=MENU_KEYBOARD,
+        )
+
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(
+            "Основной ввод теперь через меню быстрого доступа.\n\n"
+            "Нажмите кнопку, затем отправьте данные по подсказке. "
+            "Когда кто-то добавляет событие, бронь, задачу, покупку, маркетплейс, вишлист, финансы, меню или напоминание, бот отправляет уведомление в семейный чат.\n\n"
+            "Команды оставлены как запасной режим: /today, /week, /ask, /done.",
+            reply_markup=MENU_KEYBOARD,
+        )
+
+    async def add_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        args = context.args
+        if not args:
+            await update.message.reply_text("Формат: /member Мама parent #ff6b6b\nИли /join Мама")
+            return
+        name = args[0]
+        role = args[1] if len(args) > 1 else None
+        color = args[2] if len(args) > 2 else None
+        await self._save_member(update, chat_id, name, role, color)
+
+    async def join_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        if not user:
+            await update.message.reply_text("Не вижу Telegram-пользователя в сообщении.")
+            return
+        name = " ".join(context.args).strip() or user.full_name or user.username or str(user.id)
+        self.db.add_member(
+            chat_id,
+            name,
+            role=None,
+            color=None,
+            telegram_user_id=user.id,
+            username=user.username,
+            mention=user.mention_html(),
+        )
+        await update.message.reply_html(
+            f"Добавлен член семьи: {user.mention_html()} как {name}",
+            reply_markup=MENU_KEYBOARD,
+        )
+
+    async def members(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        rows = self.db.list_members(update.effective_chat.id)
+        if not rows:
+            await update.message.reply_text("Члены семьи пока не добавлены. Пример: /member Мама parent #ff6b6b")
+            return
+        lines = ["Семья:"]
+        for row in rows:
+            tg = f"@{row['username']}" if row["username"] else None
+            details = " ".join(part for part in [tg, row["role"], row["color"]] if part)
+            lines.append(f"- {row['name']} {details}".strip())
+        await update.message.reply_text("\n".join(lines))
+
+    async def add_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._add_dated_item(update, " ".join(context.args), "event", "событие")
+
+    async def add_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._add_dated_item(update, " ".join(context.args), "booking", "бронь")
+
+    async def add_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._add_dated_item(update, " ".join(context.args), "task", "задача")
+
+    async def _add_dated_item(
+        self, update: Update, text: str, kind: str, label: str
+    ) -> None:
+        try:
+            parts = split_parts(text, 3)
+        except ValueError:
+            await update.message.reply_text(
+                f"Формат: /{kind} дата | кто | что | категория | daily/weekly/monthly"
+            )
+            return
+
+        parts, recurrence = parse_recurrence(parts)
+        when = parse_datetime(parts[0])
+        if not when:
+            await update.message.reply_text("Не понял дату. Пример: завтра 18:30")
+            return
+
+        person = parts[1]
+        title = parts[2]
+        category = parts[3] if len(parts) > 3 else None
+        starts_at = when.isoformat(timespec="seconds") if kind in {"event", "booking"} else None
+        due_at = when.isoformat(timespec="seconds") if kind == "task" else None
+        item_id = self.db.add_item(
+            update.effective_chat.id,
+            kind,
+            title,
+            person=person,
+            starts_at=starts_at,
+            due_at=due_at,
+            category=category,
+            recurrence=recurrence,
+        )
+        await self._notify_family(
+            update,
+            self._build_notification(
+                update,
+                NOTIFICATION_TITLES.get(kind, f"Добавлено: {label}"),
+                item_id,
+                title,
+                person,
+                when,
+                category,
+            ),
+        )
+        await update.message.reply_text(f"Добавлено: {label} #{item_id}", reply_markup=MENU_KEYBOARD)
+
+    async def add_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text("Формат: /buy молоко 2 л")
+            return
+        await self._save_simple_item(
+            update,
+            "shopping",
+            text,
+            "Добавлено в покупки",
+            notify_title="Новая покупка",
+        )
+
+    async def add_marketplace(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text("Формат: /market WB | кроссовки ребенку | 3200 | ссылка")
+            return
+        await self._save_simple_item(
+            update,
+            "marketplace",
+            text,
+            "Добавлено в покупки на маркетплейсах",
+            notify_title="Новая покупка на маркетплейсе",
+        )
+
+    async def add_wishlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text("Формат: /wish Мама | массажер | день рождения | ссылка")
+            return
+        await self._save_simple_item(
+            update,
+            "wishlist",
+            text,
+            "Добавлено в вишлист",
+            notify_title="Новое желание в семейном вишлисте",
+        )
+
+    async def _save_simple_item(
+        self,
+        update: Update,
+        kind: str,
+        text: str,
+        reply_title: str,
+        notify_title: str | None = None,
+    ) -> int:
+        item_id = self.db.add_item(update.effective_chat.id, kind, text)
+        if notify_title:
+            await self._notify_family(update, self._build_notification(update, notify_title, item_id, text))
+        await update.message.reply_text(f"{reply_title}: #{item_id}", reply_markup=MENU_KEYBOARD)
+        return item_id
+
+    async def add_expense(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._save_expense_from_text(update, " ".join(context.args))
+
+    async def _save_expense_from_text(self, update: Update, text: str) -> None:
+        try:
+            parts = split_parts(text, 4)
+            when = parse_datetime(parts[0])
+            amount = parse_amount(parts[2])
+        except (ValueError, TypeError):
+            await update.message.reply_text("Формат: /expense дата | кто | сумма | категория | комментарий")
+            return
+        if not when:
+            await update.message.reply_text("Не понял дату расхода или платежа.")
+            return
+        notes = parts[4] if len(parts) > 4 else None
+        item_id = self.db.add_item(
+            update.effective_chat.id,
+            "expense",
+            notes or parts[3],
+            person=parts[1],
+            due_at=when.isoformat(timespec="seconds"),
+            amount=amount,
+            category=parts[3],
+        )
+        await self._notify_family(
+            update,
+            self._build_notification(update, "Новая финансовая запись", item_id, notes or parts[3], parts[1], when, parts[3]),
+        )
+        await update.message.reply_text(f"Добавлено в финансы: #{item_id}", reply_markup=MENU_KEYBOARD)
+
+    async def add_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._save_menu_from_text(update, " ".join(context.args))
+
+    async def _save_menu_from_text(self, update: Update, text: str) -> None:
+        try:
+            parts = split_parts(text, 3)
+            when = parse_datetime(parts[0])
+        except ValueError:
+            await update.message.reply_text("Формат: /menu дата | прием пищи | блюдо")
+            return
+        if not when:
+            await update.message.reply_text("Не понял дату для меню.")
+            return
+        item_id = self.db.add_item(
+            update.effective_chat.id,
+            "menu",
+            parts[2],
+            starts_at=when.isoformat(timespec="seconds"),
+            category=parts[1],
+        )
+        await self._notify_family(update, self._build_notification(update, "Новое меню", item_id, parts[2], None, when, parts[1]))
+        await update.message.reply_text(f"Добавлено в меню: #{item_id}", reply_markup=MENU_KEYBOARD)
+
+    async def add_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text("Формат: /note текст заметки")
+            return
+        await self._save_simple_item(
+            update,
+            "note",
+            text,
+            "Заметка сохранена",
+            notify_title="Новая семейная заметка",
+        )
+
+    async def add_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = " ".join(context.args)
+        try:
+            parts = split_parts(text, 3)
+            when = parse_datetime(parts[0])
+        except ValueError:
+            await update.message.reply_text("Формат: /remind завтра 09:00 | Мама | взять документы")
+            return
+        if not when:
+            await update.message.reply_text("Не понял дату напоминания.")
+            return
+        reminder_id = self.db.add_reminder(
+            update.effective_chat.id,
+            when.isoformat(timespec="seconds"),
+            parts[2],
+            parts[1],
+        )
+        await self._notify_family(update, self._build_notification(update, "Новое напоминание", reminder_id, parts[2], parts[1], when))
+        await update.message.reply_text(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
+
+    async def done(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args or not context.args[0].isdigit():
+            await update.message.reply_text("Формат: /done ID")
+            return
+        ok = self.db.mark_done(update.effective_chat.id, int(context.args[0]))
+        await update.message.reply_text(
+            "Готово." if ok else "Не нашел такую запись в этом чате.",
+            reply_markup=MENU_KEYBOARD,
+        )
+
+    async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        now = datetime.now()
+        start = datetime.combine(now.date(), time.min)
+        end = start + timedelta(days=1)
+        items = self.db.list_window(update.effective_chat.id, start, end)
+        await update.message.reply_text(render_items("Сегодня", items), reply_markup=MENU_KEYBOARD)
+
+    async def week(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        now = datetime.now()
+        end = now + timedelta(days=7)
+        items = self.db.list_window(update.effective_chat.id, now - timedelta(hours=1), end)
+        await update.message.reply_text(render_items("Ближайшие 7 дней", items), reply_markup=MENU_KEYBOARD)
+
+    async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        question = " ".join(context.args).strip()
+        await self._answer_ai(update, question)
+
+    async def _answer_ai(self, update: Update, question: str) -> None:
+        if not question:
+            await update.message.reply_text("Формат: /ask Что у нас завтра?")
+            return
+        items = self.db.list_context(update.effective_chat.id)
+        try:
+            answer = await asyncio.to_thread(self.ai.answer, question, render_context(items))
+        except Exception:
+            LOGGER.exception("AI request failed")
+            answer = "AI-помощник сейчас не ответил. Проверьте OPENAI_API_KEY, модель и доступ к API."
+        await update.message.reply_text(answer[:3900], reply_markup=MENU_KEYBOARD)
+
+    async def handle_menu_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = (update.message.text or "").strip()
+        if not text:
+            return
+
+        if text == "Отмена":
+            context.user_data.pop("flow", None)
+            context.user_data.pop("constructor", None)
+            await update.message.reply_text("Ок, действие отменено.", reply_markup=MENU_KEYBOARD)
+            return
+
+        if text in {"Сегодня", "☀️ Сегодня"}:
+            await self.today(update, context)
+            return
+        if text in {"Неделя", "📅 Неделя"}:
+            await self.week(update, context)
+            return
+        if text == "Помощь":
+            await self.help(update, context)
+            return
+        if text in MENU_TO_FLOW:
+            flow = MENU_TO_FLOW[text]
+            if flow in CONSTRUCTORS:
+                await self._start_constructor(update, context, flow)
+                return
+            context.user_data["flow"] = flow
+            await update.message.reply_text(FLOW_PROMPTS[flow], reply_markup=MENU_KEYBOARD)
+            return
+
+        if context.user_data.get("constructor"):
+            await self._handle_constructor_input(update, context, text)
+            return
+
+        flow = context.user_data.pop("flow", None)
+        if not flow:
+            await update.message.reply_text(
+                "Выберите действие в меню, затем отправьте данные.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        await self._handle_flow_input(update, context, flow, text)
+
+    async def _handle_flow_input(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, flow: str, text: str
+    ) -> None:
+        if flow == "member":
+            parts = text.split()
+            if not parts:
+                await update.message.reply_text(FLOW_PROMPTS["member"], reply_markup=MENU_KEYBOARD)
+                return
+            await self._save_member(
+                update,
+                update.effective_chat.id,
+                parts[0],
+                parts[1] if len(parts) > 1 else None,
+                parts[2] if len(parts) > 2 else None,
+            )
+            return
+        if flow == "event":
+            await self._add_dated_item(update, text, "event", "событие")
+            return
+        if flow == "booking":
+            await self._add_dated_item(update, text, "booking", "бронь")
+            return
+        if flow == "task":
+            await self._add_dated_item(update, text, "task", "задача")
+            return
+        if flow == "reminder":
+            await self._save_reminder_from_text(update, text)
+            return
+        if flow == "shopping":
+            await self._save_simple_item(
+                update,
+                "shopping",
+                text,
+                "Добавлено в покупки",
+                notify_title="Новая покупка",
+            )
+            return
+        if flow == "marketplace":
+            await self._save_simple_item(
+                update,
+                "marketplace",
+                text,
+                "Добавлено в покупки на маркетплейсах",
+                notify_title="Новая покупка на маркетплейсе",
+            )
+            return
+        if flow == "wishlist":
+            await self._save_simple_item(
+                update,
+                "wishlist",
+                text,
+                "Добавлено в вишлист",
+                notify_title="Новое желание в семейном вишлисте",
+            )
+            return
+        if flow == "expense":
+            await self._save_expense_from_text(update, text)
+            return
+        if flow == "menu":
+            await self._save_menu_from_text(update, text)
+            return
+        if flow == "note":
+            await self._save_simple_item(
+                update,
+                "note",
+                text,
+                "Заметка сохранена",
+                notify_title="Новая семейная заметка",
+            )
+            return
+        if flow == "ai":
+            await self._answer_ai(update, text)
+            return
+        if flow == "done":
+            if not text.isdigit():
+                await update.message.reply_text("Нужен числовой ID записи.", reply_markup=MENU_KEYBOARD)
+                return
+            ok = self.db.mark_done(update.effective_chat.id, int(text))
+            await update.message.reply_text(
+                "Готово." if ok else "Не нашел такую запись в этом чате.",
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        await update.message.reply_text("Не понял действие. Выберите пункт меню заново.", reply_markup=MENU_KEYBOARD)
+
+    async def _start_constructor(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, flow: str
+    ) -> None:
+        context.user_data.pop("flow", None)
+        context.user_data["constructor"] = {"flow": flow, "step": 0, "data": {}}
+        await self._send_constructor_step(update, context, flow, 0)
+
+    async def _send_constructor_step(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, flow: str, step: int
+    ) -> None:
+        field, _prompt = CONSTRUCTORS[flow][step]
+        if field == "person":
+            members = self.db.list_members(update.effective_chat.id)
+            if members:
+                keyboard = [
+                    [InlineKeyboardButton(self._member_button_label(member), callback_data=f"member:{member['id']}")]
+                    for member in members
+                ]
+                keyboard.append([InlineKeyboardButton("Ввести вручную", callback_data="member:manual")])
+                await update.message.reply_text(
+                    self._constructor_prompt(flow, step),
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+                return
+        await update.message.reply_text(
+            self._constructor_prompt(flow, step),
+            reply_markup=MENU_KEYBOARD,
+        )
+
+    async def _handle_constructor_input(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+    ) -> None:
+        state = context.user_data.get("constructor")
+        if not state:
+            return
+
+        flow = state["flow"]
+        step = int(state["step"])
+        field, _prompt = CONSTRUCTORS[flow][step]
+        normalized = None if text.strip() == "-" else text.strip()
+
+        error = self._validate_constructor_field(flow, field, normalized)
+        if error:
+            await update.message.reply_text(error, reply_markup=MENU_KEYBOARD)
+            return
+
+        state["data"][field] = normalized
+        step += 1
+        if step < len(CONSTRUCTORS[flow]):
+            state["step"] = step
+            context.user_data["constructor"] = state
+            await self._send_constructor_step(update, context, flow, step)
+            return
+
+        context.user_data.pop("constructor", None)
+        await self._save_constructor_result(update, flow, state["data"])
+
+    async def choose_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        if not self._is_access_allowed(update):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+
+        state = context.user_data.get("constructor")
+        if not state:
+            await query.answer("Конструктор уже закрыт", show_alert=True)
+            return
+
+        flow = state["flow"]
+        step = int(state["step"])
+        field, _prompt = CONSTRUCTORS[flow][step]
+        if field != "person":
+            await query.answer("Сейчас выбирается другое поле", show_alert=True)
+            return
+
+        value = (query.data or "").removeprefix("member:")
+        if value == "manual":
+            await query.answer()
+            await query.edit_message_text("Введите имя вручную.")
+            return
+
+        member = self.db.get_member(query.message.chat_id, int(value))
+        if not member:
+            await query.answer("Участник не найден", show_alert=True)
+            return
+
+        member_text = self._member_display(member)
+        state["data"][field] = member_text
+        step += 1
+        await query.answer()
+        await query.edit_message_text(f"Выбрано: {member_text}", parse_mode="HTML")
+
+        if step < len(CONSTRUCTORS[flow]):
+            state["step"] = step
+            context.user_data["constructor"] = state
+            await query.message.reply_text(
+                self._constructor_prompt(flow, step),
+                reply_markup=MENU_KEYBOARD,
+            )
+            return
+
+        context.user_data.pop("constructor", None)
+        await self._save_constructor_result(update, flow, state["data"])
+
+    def _constructor_prompt(self, flow: str, step: int) -> str:
+        total = len(CONSTRUCTORS[flow])
+        _field, prompt = CONSTRUCTORS[flow][step]
+        return f"Шаг {step + 1}/{total}\n{prompt}"
+
+    def _member_button_label(self, member) -> str:
+        if member["username"]:
+            return f"{member['name']} (@{member['username']})"
+        return str(member["name"])
+
+    def _member_display(self, member) -> str:
+        return member["mention"] or str(member["name"])
+
+    def _validate_constructor_field(
+        self, flow: str, field: str, value: str | None
+    ) -> str | None:
+        if field in {"date", "person", "title"} and not value:
+            return "Это поле нужно заполнить. Для отмены отправьте Отмена."
+        if field == "date" and value and not parse_datetime(value):
+            return "Не понял дату. Пример: завтра 18:30"
+        if field == "recurrence" and value and value.lower() not in {"daily", "weekly", "monthly"}:
+            return "Повтор должен быть daily, weekly, monthly или '-'."
+        return None
+
+    async def _save_constructor_result(
+        self, update: Update, flow: str, data: dict[str, str | None]
+    ) -> None:
+        if flow in {"event", "task"}:
+            when = parse_datetime(data["date"] or "")
+            if not when:
+                await update.message.reply_text("Не понял дату. Запись не сохранена.", reply_markup=MENU_KEYBOARD)
+                return
+            kind = flow
+            label = "событие" if flow == "event" else "задача"
+            title = data["title"] or ""
+            person = data["person"]
+            category = data.get("category")
+            recurrence = data.get("recurrence")
+            item_id = self.db.add_item(
+                update.effective_chat.id,
+                kind,
+                title,
+                person=person,
+                starts_at=when.isoformat(timespec="seconds") if flow == "event" else None,
+                due_at=when.isoformat(timespec="seconds") if flow == "task" else None,
+                category=category,
+                recurrence=recurrence.lower() if recurrence else None,
+            )
+            await self._notify_family(
+                update,
+                self._build_notification(
+                    update,
+                    NOTIFICATION_TITLES[kind],
+                    item_id,
+                    title,
+                    person,
+                    when,
+                    category,
+                ),
+            )
+            await update.message.reply_html(f"Добавлено: {label} #{item_id}", reply_markup=MENU_KEYBOARD)
+            return
+
+        if flow == "shopping":
+            text = data["title"] or ""
+            if data.get("notes"):
+                text = f"{text} - {data['notes']}"
+            await self._save_simple_item(
+                update,
+                "shopping",
+                text,
+                "Добавлено в покупки",
+                notify_title="Новая покупка",
+            )
+            return
+
+        if flow == "wishlist":
+            parts = [data.get("title"), data.get("category"), data.get("notes")]
+            text = " | ".join(part for part in parts if part)
+            item_id = self.db.add_item(
+                update.effective_chat.id,
+                "wishlist",
+                data["title"] or "",
+                person=data.get("person"),
+                category=data.get("category"),
+                notes=data.get("notes"),
+            )
+            await self._notify_family(
+                update,
+                self._build_notification(
+                    update,
+                    "Новое желание в семейном вишлисте",
+                    item_id,
+                    text,
+                    data.get("person"),
+                    None,
+                    data.get("category"),
+                ),
+            )
+            await update.message.reply_html(f"Добавлено в вишлист: #{item_id}", reply_markup=MENU_KEYBOARD)
+            return
+
+        if flow == "reminder":
+            when = parse_datetime(data["date"] or "")
+            if not when:
+                await update.message.reply_text("Не понял дату. Напоминание не сохранено.", reply_markup=MENU_KEYBOARD)
+                return
+            reminder_id = self.db.add_reminder(
+                update.effective_chat.id,
+                when.isoformat(timespec="seconds"),
+                data["title"] or "",
+                data.get("person"),
+            )
+            await self._notify_family(
+                update,
+                self._build_notification(
+                    update,
+                    "Новое напоминание",
+                    reminder_id,
+                    data["title"] or "",
+                    data.get("person"),
+                    when,
+                ),
+            )
+            await update.message.reply_html(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
+            return
+
+        await update.message.reply_text("Не понял конструктор. Запись не сохранена.", reply_markup=MENU_KEYBOARD)
+
+    async def _save_member(
+        self,
+        update: Update,
+        chat_id: int,
+        name: str,
+        role: str | None,
+        color: str | None,
+    ) -> None:
+        self.db.add_member(chat_id, name, role, color)
+        await update.message.reply_text(f"Добавлено: {name}", reply_markup=MENU_KEYBOARD)
+
+    async def _save_reminder_from_text(self, update: Update, text: str) -> None:
+        try:
+            parts = split_parts(text, 3)
+            when = parse_datetime(parts[0])
+        except ValueError:
+            await update.message.reply_text(FLOW_PROMPTS["reminder"], reply_markup=MENU_KEYBOARD)
+            return
+        if not when:
+            await update.message.reply_text("Не понял дату напоминания.", reply_markup=MENU_KEYBOARD)
+            return
+        reminder_id = self.db.add_reminder(
+            update.effective_chat.id,
+            when.isoformat(timespec="seconds"),
+            parts[2],
+            parts[1],
+        )
+        await self._notify_family(update, self._build_notification(update, "Новое напоминание", reminder_id, parts[2], parts[1], when))
+        await update.message.reply_text(f"Напоминание создано: #{reminder_id}", reply_markup=MENU_KEYBOARD)
+
+    async def _notify_family(self, update: Update, text: str) -> None:
+        await update.get_bot().send_message(chat_id=update.effective_chat.id, text=text, parse_mode="HTML")
+
+    def _build_notification(
+        self,
+        update: Update,
+        title: str,
+        item_id: int,
+        text: str,
+        person: str | None = None,
+        when: datetime | None = None,
+        category: str | None = None,
+    ) -> str:
+        author = self._author_name(update)
+        lines = [f"{escape(title)}: #{item_id}", escape(text)]
+        details = []
+        if person:
+            details.append(f"кому: {self._format_person(person)}")
+        if when:
+            details.append(f"когда: {escape(when.strftime('%d.%m %H:%M'))}")
+        if category:
+            details.append(f"раздел: {escape(category)}")
+        if author:
+            details.append(f"добавил: {escape(author)}")
+        if details:
+            lines.append(", ".join(details))
+        return "\n".join(lines)
+
+    def _format_person(self, person: str) -> str:
+        if person.startswith("<a href=\"tg://user?id="):
+            return person
+        return escape(person)
+
+    def _author_name(self, update: Update) -> str | None:
+        user = update.effective_user
+        if not user:
+            return None
+        return user.full_name or user.username
+
+    def _is_access_allowed(self, update: Update) -> bool:
+        if not self.settings.allowed_chat_ids and not self.settings.allowed_user_ids:
+            return True
+
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat and chat.id in self.settings.allowed_chat_ids:
+            return True
+        if user and user.id in self.settings.allowed_user_ids:
+            return True
+        return False
+
+    async def _deny_access(self, update: Update) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else "unknown"
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        LOGGER.warning("Denied access for chat_id=%s user_id=%s", chat_id, user_id)
+        if update.message:
+            await update.message.reply_text(
+                "Доступ к семейному боту закрыт. Отправьте /id владельцу бота, чтобы вас добавили."
+            )
+
+    def _restricted(
+        self,
+        callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]],
+    ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not self._is_access_allowed(update):
+                await self._deny_access(update)
+                return
+            await callback(update, context)
+
+        return wrapper
+
+    async def send_due_reminders(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        now = datetime.now()
+        reminders = self.db.due_reminders(now, self.settings.reminder_lookahead_minutes)
+        for reminder in reminders:
+            person = f" для {reminder['person']}" if reminder["person"] else ""
+            try:
+                await context.bot.send_message(
+                    chat_id=reminder["chat_id"],
+                    text=f"Напоминание{person}: {reminder['text']}",
+                )
+                self.db.mark_reminder_sent(int(reminder["id"]))
+            except Exception:
+                LOGGER.exception("Failed to send reminder %s", reminder["id"])
+
+    def build_application(self) -> Application:
+        app = Application.builder().token(self.settings.telegram_bot_token).build()
+        if not self.settings.allowed_chat_ids and not self.settings.allowed_user_ids:
+            LOGGER.warning("Access allowlist is empty. Bot is available to anyone who can message it.")
+
+        app.add_handler(CommandHandler("id", self.show_ids))
+        app.add_handler(CommandHandler("start", self._restricted(self.start)))
+        app.add_handler(CommandHandler("keyboard", self._restricted(self.menu)))
+        app.add_handler(CommandHandler("help", self._restricted(self.help)))
+        app.add_handler(CommandHandler("join", self._restricted(self.join_member)))
+        app.add_handler(CommandHandler("member", self._restricted(self.add_member)))
+        app.add_handler(CommandHandler("members", self._restricted(self.members)))
+        app.add_handler(CommandHandler("event", self._restricted(self.add_event)))
+        app.add_handler(CommandHandler("booking", self._restricted(self.add_booking)))
+        app.add_handler(CommandHandler("task", self._restricted(self.add_task)))
+        app.add_handler(CommandHandler("buy", self._restricted(self.add_buy)))
+        app.add_handler(CommandHandler("market", self._restricted(self.add_marketplace)))
+        app.add_handler(CommandHandler("wish", self._restricted(self.add_wishlist)))
+        app.add_handler(CommandHandler("expense", self._restricted(self.add_expense)))
+        app.add_handler(CommandHandler("menu", self._restricted(self.add_menu)))
+        app.add_handler(CommandHandler("note", self._restricted(self.add_note)))
+        app.add_handler(CommandHandler("remind", self._restricted(self.add_reminder)))
+        app.add_handler(CommandHandler("done", self._restricted(self.done)))
+        app.add_handler(CommandHandler("today", self._restricted(self.today)))
+        app.add_handler(CommandHandler("week", self._restricted(self.week)))
+        app.add_handler(CommandHandler("ask", self._restricted(self.ask)))
+        app.add_handler(CallbackQueryHandler(self.choose_member, pattern=r"^member:"))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._restricted(self.handle_menu_text)))
+        app.job_queue.run_repeating(self.send_due_reminders, interval=60, first=5)
+        return app
+
+
+def main() -> None:
+    settings = load_settings()
+    bot = FamilyPlannerBot(settings)
+    app = bot.build_application()
+    LOGGER.info("Family planner bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)

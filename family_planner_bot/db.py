@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Iterable
+
+
+@dataclass(frozen=True)
+class Item:
+    id: int
+    kind: str
+    chat_id: int
+    title: str
+    person: str | None
+    starts_at: str | None
+    due_at: str | None
+    amount: float | None
+    category: str | None
+    recurrence: str | None
+    notes: str | None
+    is_done: bool
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.init_schema()
+
+    @contextmanager
+    def connect(self) -> Iterable[sqlite3.Connection]:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init_schema(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    telegram_user_id INTEGER,
+                    name TEXT NOT NULL,
+                    username TEXT,
+                    mention TEXT,
+                    role TEXT,
+                    color TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(chat_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    person TEXT,
+                    starts_at TEXT,
+                    due_at TEXT,
+                    amount REAL,
+                    category TEXT,
+                    recurrence TEXT,
+                    notes TEXT,
+                    is_done INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_items_chat_kind ON items(chat_id, kind);
+                CREATE INDEX IF NOT EXISTS idx_items_starts ON items(chat_id, starts_at);
+                CREATE INDEX IF NOT EXISTS idx_items_due ON items(chat_id, due_at);
+
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    person TEXT,
+                    text TEXT NOT NULL,
+                    remind_at TEXT NOT NULL,
+                    sent_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reminders_pending
+                    ON reminders(chat_id, remind_at, sent_at);
+                """
+            )
+            self._ensure_column(conn, "members", "telegram_user_id", "INTEGER")
+            self._ensure_column(conn, "members", "username", "TEXT")
+            self._ensure_column(conn, "members", "mention", "TEXT")
+
+    def add_member(
+        self,
+        chat_id: int,
+        name: str,
+        role: str | None,
+        color: str | None,
+        telegram_user_id: int | None = None,
+        username: str | None = None,
+        mention: str | None = None,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO members(
+                    chat_id, telegram_user_id, name, username, mention, role, color, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, name)
+                DO UPDATE SET
+                    telegram_user_id = COALESCE(excluded.telegram_user_id, members.telegram_user_id),
+                    username = COALESCE(excluded.username, members.username),
+                    mention = COALESCE(excluded.mention, members.mention),
+                    role = excluded.role,
+                    color = excluded.color
+                """,
+                (chat_id, telegram_user_id, name, username, mention, role, color, now),
+            )
+
+    def list_members(self, chat_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, telegram_user_id, name, username, mention, role, color
+                FROM members
+                WHERE chat_id = ?
+                ORDER BY name
+                """,
+                (chat_id,),
+            ).fetchall()
+        return list(rows)
+
+    def get_member(self, chat_id: int, member_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, telegram_user_id, name, username, mention, role, color
+                FROM members
+                WHERE chat_id = ? AND id = ?
+                """,
+                (chat_id, member_id),
+            ).fetchone()
+
+    def add_item(
+        self,
+        chat_id: int,
+        kind: str,
+        title: str,
+        person: str | None = None,
+        starts_at: str | None = None,
+        due_at: str | None = None,
+        amount: float | None = None,
+        category: str | None = None,
+        recurrence: str | None = None,
+        notes: str | None = None,
+    ) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO items(
+                    chat_id, kind, title, person, starts_at, due_at, amount,
+                    category, recurrence, notes, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    kind,
+                    title,
+                    person,
+                    starts_at,
+                    due_at,
+                    amount,
+                    category,
+                    recurrence,
+                    notes,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def mark_done(self, chat_id: int, item_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE items SET is_done = 1 WHERE chat_id = ? AND id = ?",
+                (chat_id, item_id),
+            )
+            return cur.rowcount > 0
+
+    def list_window(self, chat_id: int, start: datetime, end: datetime) -> list[Item]:
+        start_s = start.isoformat(timespec="seconds")
+        end_s = end.isoformat(timespec="seconds")
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM items
+                WHERE chat_id = ?
+                  AND is_done = 0
+                  AND (
+                    (starts_at IS NOT NULL AND starts_at >= ? AND starts_at < ?)
+                    OR (due_at IS NOT NULL AND due_at >= ? AND due_at < ?)
+                    OR kind IN ('shopping', 'marketplace', 'wishlist', 'note')
+                  )
+                ORDER BY COALESCE(starts_at, due_at, created_at), id
+                """,
+                (chat_id, start_s, end_s, start_s, end_s),
+            ).fetchall()
+            recurring_rows = conn.execute(
+                """
+                SELECT * FROM items
+                WHERE chat_id = ?
+                  AND is_done = 0
+                  AND recurrence IS NOT NULL
+                  AND (starts_at IS NOT NULL OR due_at IS NOT NULL)
+                """,
+                (chat_id,),
+            ).fetchall()
+
+        items = [self._item_from_row(row) for row in rows]
+        items.extend(
+            occurrence
+            for row in recurring_rows
+            if (occurrence := self._expand_recurring(row, start, end)) is not None
+        )
+        unique = {(item.id, item.starts_at, item.due_at): item for item in items}
+        return sorted(
+            unique.values(),
+            key=lambda item: (item.starts_at or item.due_at or "", item.id),
+        )
+
+    def list_context(self, chat_id: int, days: int = 14) -> list[Item]:
+        now = datetime.now()
+        return self.list_window(chat_id, now - timedelta(days=1), now + timedelta(days=days))
+
+    def add_reminder(self, chat_id: int, remind_at: str, text: str, person: str | None) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO reminders(chat_id, person, text, remind_at, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (chat_id, person, text, remind_at, now),
+            )
+            return int(cur.lastrowid)
+
+    def due_reminders(self, now: datetime, lookahead_minutes: int) -> list[sqlite3.Row]:
+        until = now + timedelta(minutes=lookahead_minutes)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM reminders
+                WHERE sent_at IS NULL AND remind_at <= ?
+                ORDER BY remind_at, id
+                """,
+                (until.isoformat(timespec="seconds"),),
+            ).fetchall()
+        return list(rows)
+
+    def mark_reminder_sent(self, reminder_id: int) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE reminders SET sent_at = ? WHERE id = ?",
+                (now, reminder_id),
+            )
+
+    @staticmethod
+    def _item_from_row(row: sqlite3.Row) -> Item:
+        return Item(
+            id=int(row["id"]),
+            kind=str(row["kind"]),
+            chat_id=int(row["chat_id"]),
+            title=str(row["title"]),
+            person=row["person"],
+            starts_at=row["starts_at"],
+            due_at=row["due_at"],
+            amount=row["amount"],
+            category=row["category"],
+            recurrence=row["recurrence"],
+            notes=row["notes"],
+            is_done=bool(row["is_done"]),
+        )
+
+    def _expand_recurring(self, row: sqlite3.Row, start: datetime, end: datetime) -> Item | None:
+        item = self._item_from_row(row)
+        source_value = item.starts_at or item.due_at
+        if not source_value or not item.recurrence:
+            return None
+
+        try:
+            source = datetime.fromisoformat(source_value)
+        except ValueError:
+            return None
+
+        occurrence = source
+        while occurrence < start:
+            occurrence = self._next_occurrence(occurrence, item.recurrence)
+            if occurrence == source:
+                return None
+
+        if occurrence >= end:
+            return None
+
+        occurrence_s = occurrence.isoformat(timespec="seconds")
+        return Item(
+            id=item.id,
+            kind=item.kind,
+            chat_id=item.chat_id,
+            title=item.title,
+            person=item.person,
+            starts_at=occurrence_s if item.starts_at else None,
+            due_at=occurrence_s if item.due_at else None,
+            amount=item.amount,
+            category=item.category,
+            recurrence=item.recurrence,
+            notes=item.notes,
+            is_done=item.is_done,
+        )
+
+    @staticmethod
+    def _next_occurrence(value: datetime, recurrence: str) -> datetime:
+        if recurrence == "daily":
+            return value + timedelta(days=1)
+        if recurrence == "weekly":
+            return value + timedelta(weeks=1)
+        if recurrence == "monthly":
+            month = value.month + 1
+            year = value.year
+            if month > 12:
+                month = 1
+                year += 1
+            day = min(value.day, Database._days_in_month(year, month))
+            return value.replace(year=year, month=month, day=day)
+        return value
+
+    @staticmethod
+    def _days_in_month(year: int, month: int) -> int:
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1)
+        else:
+            next_month = datetime(year, month + 1, 1)
+        return (next_month - timedelta(days=1)).day
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
